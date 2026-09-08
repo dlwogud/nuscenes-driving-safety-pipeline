@@ -9,21 +9,27 @@ analysed by Flink SQL — both event-level rules and 30-second tumbling windows 
 landing in PostgreSQL.
 
 > 실제 자율주행 차량에서 수집한 nuScenes CAN 버스 데이터 기반 실시간 주행 안전성 분석 파이프라인.
-> 주파수가 제각각인 7개 CAN 채널을 10Hz로 통합·검증한 뒤 Kafka로 재생하고, Flink SQL로 급제동·
+> 2Hz~950Hz로 주파수가 제각각인 CAN 채널을 10Hz로 통합·검증한 뒤 Kafka로 재생하고, Flink SQL로 급제동·
 > 급선회·페달 오조작을 탐지하며 30초 윈도우로 난폭운전 패턴까지 집계합니다.
 
-```
-979 scenes  ·  191,089 validated records  ·  0.108% routed to DLQ  ·  2 Hz–950 Hz → one 10 Hz schema
-```
+| Scenes | Records validated | Quarantined to DLQ | Sample rates unified | Detection verified |
+|:--:|:--:|:--:|:--:|:--:|
+| **979** | **191,089** | **207** (0.108%) | **2 Hz–950 Hz → 10 Hz** | **10 / 10** expected events |
 
-## Why
+## What the real data broke
 
-Streaming pipelines are easy to demonstrate on synthetic data and hard to demonstrate on real
-data, because real sensors disagree with each other, drop out, and arrive at different rates.
-This project deliberately takes the harder path: every number below comes from recordings of an
-actual vehicle driving on public roads, and most of the engineering went into the three problems
-that only appear once the data is real — **unifying mismatched sample rates, deciding what counts
-as a broken record, and keeping event time honest**.
+Synthetic data never disagrees with itself. Real sensors drift apart, drop out, and arrive at
+different rates — and every problem below surfaced only because the input is a recording of an
+actual vehicle on a public road. Each was traced to a root cause and fixed:
+
+| Symptom | Evidence | Root cause | Fix |
+|---|---|---|---|
+| **15 records flagged as sensor faults** | every one of the 15 occurred while accelerating or braking | the 2 Hz dashboard reading is forward-filled and can be 500 ms stale, while wheel rpm is current — during a speed change the two disagree *legitimately* | tolerance now includes the physics: `speed × 35% + abs(accel) × 0.5 s` → **15 false positives → 0**, no true positive lost |
+| **A defect in the dataset itself** | 199 records from one scene | `scene-0419` ships with an **empty** `vehicle_monitor` channel | loader returns null instead of crashing; validator quarantines the scene to the DLQ with reasons |
+| **Windowed results never appeared** while event rules were perfect | watermark frozen at `15:14:12`; the window needed `15:14:30` | replay started all scenes at the same instant, so the stream spanned **20 s — shorter than the 30 s window**, which therefore could never be passed | staggered scene starts (what a real fleet looks like) widened the stream to **~100 s**; the stuck window was released too |
+| **Flink job died at startup** | `0` of `2` INSERT statements recognised | statements were classified by their first keyword, but a threshold-documenting comment precedes every INSERT | leading comment lines are skipped before classification — documentation can no longer break execution |
+
+The same parsing bug existed in this project's [predecessor](#prior-version) and was backported there.
 
 ## Architecture
 
