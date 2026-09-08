@@ -11,12 +11,15 @@ Aggregation policy (see 내부구조_사전 #2):
 """
 
 import json
+import os
 import sys
 from bisect import bisect_right
 from pathlib import Path
 from statistics import fmean
 
-DATA_DIR = Path.home() / "Downloads" / "can_bus" / "can_bus"
+DATA_DIR = Path(
+    os.environ.get("NUSCENES_CAN_DIR", Path.home() / "Downloads" / "can_bus" / "can_bus")
+)
 BIN_US = 100_000  # 100 ms grid -> 10 Hz
 
 
