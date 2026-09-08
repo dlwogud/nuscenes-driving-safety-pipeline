@@ -119,8 +119,10 @@ end — see the engineering note below.
 
 ## Running it
 
-Requires Docker and the [nuScenes CAN bus expansion](https://www.nuscenes.org/nuscenes#canbus)
-(free account; `can_bus.zip`).
+Requires Docker, Python 3.9+, and the
+[nuScenes CAN bus expansion](https://www.nuscenes.org/nuscenes#canbus) (free account, `can_bus.zip`;
+the dataset is not redistributed here). Java and Maven are not needed — the Flink job is built
+inside a container.
 
 ```bash
 export NUSCENES_CAN_DIR=/path/to/can_bus        # defaults to ~/Downloads/can_bus/can_bus
@@ -138,7 +140,9 @@ docker compose exec postgres psql -U flinkuser -d vehicle_db \
   -c "SELECT * FROM driving_windows;"
 ```
 
-Each producer module also runs standalone, without Kafka:
+The three producer modules below need **no third-party packages at all** — only the standard
+library — so the ingestion and validation stages can be inspected before any infrastructure is
+started:
 
 ```bash
 python3 producer/scene_loader.py scene-0001     # inspect the unified 10 Hz records
