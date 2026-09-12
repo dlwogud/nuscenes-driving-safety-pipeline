@@ -115,6 +115,13 @@ above, holds while the signal stays past 75% of it, and requires at least two bi
 of the single-bin accelerations were momentary spikes — road impact rather than driving. Each
 episode is stored once, with its duration and peak.
 
+The two-bin floor is a definition rather than a noise filter, and worth stating precisely because
+the obvious explanation turned out to be wrong. Single-bin crossings looked like road impact, but
+checking the vertical axis, the throttle and the subsequent speed shows otherwise: 96% of them have
+the accelerator applied, so they are genuine — merely weak, gaining a third of the speed a longer
+episode does and showing no speed gain at all in half of the cases. Commercial telematics likewise
+require a harsh event to persist, generally for longer than 200 ms.
+
 Median episode: 0.8 s for braking (peak 4.34 m/s²), 0.4 s for cornering (3.31), 0.2 s for
 acceleration (2.78).
 

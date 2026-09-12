@@ -21,8 +21,11 @@
 --   HARSH_ACCEL  enter  2.5 m/s² — low end of the industry harsh-accel
 --                                  range (2.5-3.5)                      [top 0.10%]
 -- Each hold threshold is 75% of its entry value, and an episode must span at
--- least two bins (200 ms): over half of the single-bin accelerations were
--- momentary spikes, which is road impact rather than a driving manoeuvre.
+-- least two bins (200 ms) to count as a manoeuvre — commercial telematics
+-- likewise require a harsh event to persist, usually for longer than this.
+-- Single-bin crossings are not noise: 96% of them have the accelerator applied,
+-- so they are real but weak, gaining a third of the speed a longer episode does
+-- and showing no speed gain at all in half of the cases.
 -- speed > 10 km/h guards exclude parking-lot manoeuvres throughout.
 
 CREATE TABLE vehicle_source (
