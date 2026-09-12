@@ -96,6 +96,7 @@ def load_scene(scene: str) -> list[dict]:
             lat = [r["linear_accel"][1] for r in imu_bins[i]]
             rec["accel_lon"] = round(fmean(lon), 4)
             rec["accel_lon_min"] = round(min(lon), 4)  # hard-brake spike survives here
+            rec["accel_lon_max"] = round(max(lon), 4)  # and the harsh-acceleration one
             rec["accel_lat"] = round(fmean(lat), 4)
             rec["accel_lat_max"] = round(max(lat, key=abs), 4)
 

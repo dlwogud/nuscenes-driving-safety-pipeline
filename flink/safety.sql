@@ -5,13 +5,25 @@
 -- the physically impossible, so everything here is real driving — these rules
 -- flag the physically possible but DANGEROUS.
 --
--- Thresholds are quoted, not invented, and verified against all 979 scenes:
---   HARSH_BRAKE  accel_lon_min < -4.0 m/s² (0.4 G)  — hard braking; comfortable
---                braking stays near 2.5 m/s². Fires on 0.04% of records.
---   SHARP_TURN   |accel_lat_max| > 3.0 m/s² (0.3 G) — fleet-telematics harsh
---                cornering convention. Fires on 0.09% of records.
---   PEDAL_MISUSE brake pressure > 0 while throttle > 50% — pedal misapplication.
---   speed_kmh > 10 guards exclude parking-lot noise.
+-- EPISODES, NOT BINS (내부구조_사전 #8). A manoeuvre lasts about a second, which
+-- is ten 100 ms bins, and the signal wobbles across the threshold while it does.
+-- Counting bins therefore reported one hard brake as up to ten events and one
+-- corner as three, which in turn made the 30 s window flag a single corner as
+-- aggressive driving. MATCH_RECOGNIZE collapses each manoeuvre into one row
+-- using two thresholds: the episode is ENTERED on the strong threshold and HELD
+-- while the signal stays past a weaker one, so brief dips do not split it.
+--
+-- Entry thresholds are quoted from vehicle dynamics and were then checked against
+-- all 979 scenes so that all three rules sit at the same selectivity — the top
+-- ~0.1% of bins above 10 km/h — rather than each being arbitrarily strict or loose:
+--   HARSH_BRAKE  enter -4.0 m/s² (0.4 G) — comfortable braking is ~2.5   [top 0.12%]
+--   SHARP_TURN   enter  3.0 m/s² lateral — everyday cornering is ~2      [top 0.10%]
+--   HARSH_ACCEL  enter  2.5 m/s² — low end of the industry harsh-accel
+--                                  range (2.5-3.5)                      [top 0.10%]
+-- Each hold threshold is 75% of its entry value, and an episode must span at
+-- least two bins (200 ms): over half of the single-bin accelerations were
+-- momentary spikes, which is road impact rather than a driving manoeuvre.
+-- speed > 10 km/h guards exclude parking-lot manoeuvres throughout.
 
 CREATE TABLE vehicle_source (
     vehicle_id      STRING,
@@ -22,6 +34,7 @@ CREATE TABLE vehicle_source (
     throttle        INT,
     accel_lon       DOUBLE,
     accel_lon_min   DOUBLE,
+    accel_lon_max   DOUBLE,
     accel_lat       DOUBLE,
     accel_lat_max   DOUBLE,
     steering_deg    DOUBLE,
@@ -45,13 +58,13 @@ CREATE TABLE vehicle_source (
 
 CREATE TABLE safety_events_sink (
     vehicle_id    STRING,
-    event_ts      TIMESTAMP(3),
     event_type    STRING,
-    speed_kmh     DOUBLE,
-    accel_lon_min DOUBLE,
-    accel_lat_max DOUBLE,
-    brake         INT,
-    throttle      INT
+    episode_start TIMESTAMP(3),
+    episode_end   TIMESTAMP(3),
+    duration_s    DOUBLE,
+    peak_value    DOUBLE,
+    bins          BIGINT,
+    entry_speed   DOUBLE
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:postgresql://postgres:5432/vehicle_db',
@@ -67,8 +80,9 @@ CREATE TABLE driving_windows_sink (
     window_end   TIMESTAMP(3),
     harsh_brakes BIGINT,
     sharp_turns  BIGINT,
+    harsh_accels BIGINT,
+    episode_cnt  BIGINT,
     avg_speed    DOUBLE,
-    record_cnt   BIGINT,
     flag         STRING
 ) WITH (
     'connector' = 'jdbc',
@@ -79,41 +93,114 @@ CREATE TABLE driving_windows_sink (
     'driver' = 'org.postgresql.Driver'
 );
 
--- Event-level rules: only flagged rows are stored, the stream itself is not archived.
+-- One row per braking manoeuvre. LAST(E.<col>, 1) is the previous row already
+-- matched to E: NULL on the first row, which is what makes the entry threshold
+-- apply only there and the weaker hold threshold apply afterwards.
+CREATE VIEW harsh_brake_episodes AS
+SELECT vehicle_id, 'HARSH_BRAKE' AS event_type,
+       episode_start, episode_end, peak_value, bins, entry_speed
+FROM vehicle_source
+MATCH_RECOGNIZE (
+    PARTITION BY vehicle_id
+    ORDER BY event_ts
+    MEASURES
+        FIRST(E.event_ts)     AS episode_start,
+        LAST(E.event_ts)      AS episode_end,
+        MIN(E.accel_lon_min)  AS peak_value,
+        COUNT(E.event_ts)     AS bins,
+        FIRST(E.speed_kmh)    AS entry_speed
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (E{2,})
+    DEFINE
+        E AS E.speed_kmh > 10 AND (
+                 (LAST(E.accel_lon_min, 1) IS NULL     AND E.accel_lon_min < -4.0)
+              OR (LAST(E.accel_lon_min, 1) IS NOT NULL AND E.accel_lon_min < -3.0)
+             )
+);
+
+CREATE VIEW sharp_turn_episodes AS
+SELECT vehicle_id, 'SHARP_TURN' AS event_type,
+       episode_start, episode_end, peak_value, bins, entry_speed
+FROM vehicle_source
+MATCH_RECOGNIZE (
+    PARTITION BY vehicle_id
+    ORDER BY event_ts
+    MEASURES
+        FIRST(E.event_ts)          AS episode_start,
+        LAST(E.event_ts)           AS episode_end,
+        MAX(ABS(E.accel_lat_max))  AS peak_value,
+        COUNT(E.event_ts)          AS bins,
+        FIRST(E.speed_kmh)         AS entry_speed
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (E{2,})
+    DEFINE
+        E AS E.speed_kmh > 10 AND (
+                 (LAST(E.accel_lat_max, 1) IS NULL     AND ABS(E.accel_lat_max) > 3.0)
+              OR (LAST(E.accel_lat_max, 1) IS NOT NULL AND ABS(E.accel_lat_max) > 2.25)
+             )
+);
+
+CREATE VIEW harsh_accel_episodes AS
+SELECT vehicle_id, 'HARSH_ACCEL' AS event_type,
+       episode_start, episode_end, peak_value, bins, entry_speed
+FROM vehicle_source
+MATCH_RECOGNIZE (
+    PARTITION BY vehicle_id
+    ORDER BY event_ts
+    MEASURES
+        FIRST(E.event_ts)     AS episode_start,
+        LAST(E.event_ts)      AS episode_end,
+        MAX(E.accel_lon_max)  AS peak_value,
+        COUNT(E.event_ts)     AS bins,
+        FIRST(E.speed_kmh)    AS entry_speed
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (E{2,})
+    DEFINE
+        E AS E.speed_kmh > 10 AND (
+                 (LAST(E.accel_lon_max, 1) IS NULL     AND E.accel_lon_max > 2.5)
+              OR (LAST(E.accel_lon_max, 1) IS NOT NULL AND E.accel_lon_max > 1.9)
+             )
+);
+
+CREATE VIEW safety_episodes AS
+SELECT * FROM harsh_brake_episodes
+UNION ALL
+SELECT * FROM sharp_turn_episodes
+UNION ALL
+SELECT * FROM harsh_accel_episodes;
+
+-- Each row is one manoeuvre. bins x 100 ms is how long it lasted.
 INSERT INTO safety_events_sink
 SELECT
     vehicle_id,
-    CAST(event_ts AS TIMESTAMP(3)),
-    CASE
-        WHEN accel_lon_min < -4.0 AND speed_kmh > 10      THEN 'HARSH_BRAKE'
-        WHEN ABS(accel_lat_max) > 3.0 AND speed_kmh > 10  THEN 'SHARP_TURN'
-        ELSE 'PEDAL_MISUSE'
-    END AS event_type,
-    speed_kmh,
-    accel_lon_min,
-    accel_lat_max,
-    brake,
-    throttle
-FROM vehicle_source
-WHERE (accel_lon_min < -4.0 AND speed_kmh > 10)
-   OR (ABS(accel_lat_max) > 3.0 AND speed_kmh > 10)
-   OR (brake > 0 AND throttle > 50);
+    event_type,
+    episode_start,
+    episode_end,
+    CAST(bins AS DOUBLE) * 0.1 AS duration_s,
+    ROUND(peak_value, 3),
+    bins,
+    entry_speed
+FROM safety_episodes;
 
--- 30 s tumbling window per vehicle: a single harsh event may be an evasive
--- maneuver; three or more inside 30 s is a driving pattern.
+-- 30 s tumbling window per vehicle, now counting manoeuvres rather than bins:
+-- three separate harsh manoeuvres inside 30 s is a driving pattern, whereas a
+-- single corner that wobbles across the threshold is not.
 INSERT INTO driving_windows_sink
 SELECT
     vehicle_id,
     window_start,
     window_end,
-    SUM(CASE WHEN accel_lon_min < -4.0 AND speed_kmh > 10 THEN 1 ELSE 0 END)     AS harsh_brakes,
-    SUM(CASE WHEN ABS(accel_lat_max) > 3.0 AND speed_kmh > 10 THEN 1 ELSE 0 END) AS sharp_turns,
-    ROUND(AVG(speed_kmh), 1) AS avg_speed,
-    COUNT(*)                 AS record_cnt,
-    'AGGRESSIVE_DRIVING'     AS flag
+    SUM(CASE WHEN event_type = 'HARSH_BRAKE' THEN 1 ELSE 0 END) AS harsh_brakes,
+    SUM(CASE WHEN event_type = 'SHARP_TURN'  THEN 1 ELSE 0 END) AS sharp_turns,
+    SUM(CASE WHEN event_type = 'HARSH_ACCEL' THEN 1 ELSE 0 END) AS harsh_accels,
+    COUNT(*)                       AS episode_cnt,
+    ROUND(AVG(entry_speed), 1)     AS avg_speed,
+    'AGGRESSIVE_DRIVING'           AS flag
 FROM TABLE(
-    TUMBLE(TABLE vehicle_source, DESCRIPTOR(event_ts), INTERVAL '30' SECOND)
+    TUMBLE(TABLE safety_episodes, DESCRIPTOR(episode_end), INTERVAL '30' SECOND)
 )
 GROUP BY vehicle_id, window_start, window_end
-HAVING SUM(CASE WHEN accel_lon_min < -4.0 AND speed_kmh > 10 THEN 1 ELSE 0 END)
-     + SUM(CASE WHEN ABS(accel_lat_max) > 3.0 AND speed_kmh > 10 THEN 1 ELSE 0 END) >= 3;
+HAVING COUNT(*) >= 3;

@@ -12,9 +12,9 @@ landing in PostgreSQL.
 > 2Hz~950Hz로 주파수가 제각각인 CAN 채널을 10Hz로 통합·검증한 뒤 Kafka로 재생하고, Flink SQL로 급제동·
 > 급선회·페달 오조작을 탐지하며 30초 윈도우로 난폭운전 패턴까지 집계합니다.
 
-| Scenes | Records validated | Quarantined to DLQ | Sample rates unified | Detection verified |
+| Scenes | Records validated | Quarantined to DLQ | Sample rates unified | Manoeuvres detected |
 |:--:|:--:|:--:|:--:|:--:|
-| **979** | **191,089** | **207** (0.108%) | **2 Hz–950 Hz → 10 Hz** | **10 / 10** expected events |
+| **979** | **191,089** | **207** (0.108%) | **2 Hz–950 Hz → 10 Hz** | **104** across 92 scenes |
 
 ## What the real data broke
 
@@ -28,8 +28,10 @@ actual vehicle on a public road. Each was traced to a root cause and fixed:
 | **A defect in the dataset itself** | 199 records from one scene | `scene-0419` ships with an **empty** `vehicle_monitor` channel | loader returns null instead of crashing; validator quarantines the scene to the DLQ with reasons |
 | **Windowed results never appeared** while event rules were perfect | watermark frozen at `15:14:12`; the window needed `15:14:30` | replay started all scenes at the same instant, so the stream spanned **20 s — shorter than the 30 s window**, which therefore could never be passed | staggered scene starts (what a real fleet looks like) widened the stream to **~100 s**; the stuck window was released too |
 | **Flink job died at startup** | `0` of `2` INSERT statements recognised | statements were classified by their first keyword, but a threshold-documenting comment precedes every INSERT | leading comment lines are skipped before classification — documentation can no longer break execution |
+| **Event counts were inflated up to 10×** | one hard brake reported as 2 rows, one corner as 3 — and that corner was the only thing the 30 s window ever flagged as aggressive driving | a manoeuvre lasts about a second, i.e. ten 100 ms bins, and every bin that crossed the threshold became its own event; counting bins is not counting manoeuvres | `MATCH_RECOGNIZE` with two thresholds collapses each manoeuvre into **one** row — the aggressive-driving flag now counts manoeuvres, and its single previous hit turned out to be a **false positive** |
+| **A rule that detected nothing real** | `PEDAL_MISUSE` reported 30 hits; the raw data contains **6**, all at 0.00 km/h | `throttle` is a raw CAN value (0–496), not the percentage the rule's comment claimed, and the rule had no speed guard — the 6 hits are a stationary car being eased off the brake | replaced with `HARSH_ACCEL`, completing the standard harsh-braking / cornering / acceleration triad |
 
-The same parsing bug existed in this project's [predecessor](#prior-version) and was backported there.
+The parsing bug also existed in this project's [predecessor](#prior-version) and was backported there.
 
 ## Architecture
 
@@ -92,31 +94,43 @@ was lost.
 
 ## Detection rules
 
-Thresholds are quoted from vehicle specifications and tyre-friction limits rather than invented,
-then measured against all 979 scenes so their selectivity is known before deployment.
+Entry thresholds are quoted from vehicle dynamics rather than invented, then checked against all
+979 scenes so that all three sit at the **same selectivity** — the top ~0.1% of bins above
+10 km/h — instead of each being arbitrarily strict or loose.
 
-| Rule | Condition | Rationale | Fires on |
+| Rule | Entry threshold | Rationale | Manoeuvres |
 |---|---|---|---|
-| `HARSH_BRAKE` | `accel_lon_min < −4.0 m/s²` and speed > 10 km/h | comfortable braking sits near 2.5 m/s²; 4 m/s² (0.4 G) is a genuine hard stop | 85 records |
-| `SHARP_TURN` | `abs(accel_lat_max) > 3.0 m/s²` and speed > 10 km/h | lateral acceleration already encodes speed × curvature, so it is a better signal than steering angle alone | 168 records |
-| `PEDAL_MISUSE` | brake applied while throttle > 50% | simultaneous brake and throttle indicates misapplication or a control fault | 30 records |
-| `AGGRESSIVE_DRIVING` | ≥ 3 harsh events within a 30 s tumbling window, per vehicle | one hard brake may be evasive; three in 30 seconds is a driving pattern | window-level |
+| `HARSH_BRAKE` | `accel_lon_min < −4.0 m/s²` | comfortable braking sits near 2.5 m/s²; 4 m/s² (0.4 G) is a genuine hard stop — top 0.12% | **15** |
+| `SHARP_TURN` | `abs(accel_lat_max) > 3.0 m/s²` | lateral acceleration already encodes speed × curvature, so it beats steering angle alone — top 0.10% | **47** |
+| `HARSH_ACCEL` | `accel_lon_max > 2.5 m/s²` | low end of the industry harsh-acceleration range (2.5–3.5) and top 0.10% here | **42** |
+| `AGGRESSIVE_DRIVING` | ≥ 3 manoeuvres in one 30 s window | one hard brake may be evasive; three separate manoeuvres in 30 seconds is a pattern | 1 scene |
 
-The speed guards exclude parking-lot manoeuvres, where large steering angles and small
-decelerations are normal.
+Every rule is guarded by `speed > 10 km/h`, which excludes parking-lot manoeuvres where large
+steering angles and small decelerations are normal.
 
-## Verified run
+**Manoeuvres, not threshold crossings.** A hard brake lasts about a second — ten 100 ms bins — and
+the signal wobbles across the threshold while it does, so counting bins counted one brake up to ten
+times. Each rule is therefore evaluated as an *episode*: `MATCH_RECOGNIZE` enters on the threshold
+above, holds while the signal stays past 75% of it, and requires at least two bins, since over half
+of the single-bin accelerations were momentary spikes — road impact rather than driving. Each
+episode is stored once, with its duration and peak.
 
-Expected event counts were computed independently from the scene files, then compared against
-what the running pipeline actually wrote to PostgreSQL.
+Median episode: 0.8 s for braking (peak 4.34 m/s²), 0.4 s for cornering (3.31), 0.2 s for
+acceleration (2.78).
 
-| | Expected | In PostgreSQL |
-|---|---|---|
-| `HARSH_BRAKE` | 2 | 2 |
-| `PEDAL_MISUSE` | 5 | 5 |
-| `SHARP_TURN` | 3 | 3 |
+## Verification
 
-15 scenes, 2,905 records, replayed with staggered start times.
+Detection output is checked against expectations computed independently of the pipeline: the same
+rule logic is applied directly to the scene files, and the counts are compared with what the
+running cluster wrote to PostgreSQL.
+
+Running that way on 15 scenes (2,905 records, staggered starts) reproduced the expected counts
+exactly — 2 hard brakes, 3 sharp turns, 5 of the since-removed pedal rule — which is what surfaced
+the inflation problem: the expectation and the pipeline agreed with each other while both counted
+threshold crossings rather than manoeuvres.
+
+The episode rules above are measured across all 979 scenes (104 manoeuvres in 92 scenes);
+re-running the cluster against those figures is the next step.
 
 The windowed aggregation flagged `scene-0308`, whose three sharp turns fall inside one 30-second
 window, as `AGGRESSIVE_DRIVING`. Two window rows were written rather than one: the second was a
