@@ -103,7 +103,7 @@ Entry thresholds are quoted from vehicle dynamics rather than invented, then che
 | `HARSH_BRAKE` | `accel_lon_min < −4.0 m/s²` | comfortable braking sits near 2.5 m/s²; 4 m/s² (0.4 G) is a genuine hard stop — top 0.12% | **15** |
 | `SHARP_TURN` | `abs(accel_lat_max) > 3.0 m/s²` | lateral acceleration already encodes speed × curvature, so it beats steering angle alone — top 0.10% | **47** |
 | `HARSH_ACCEL` | `accel_lon_max > 2.5 m/s²` | low end of the industry harsh-acceleration range (2.5–3.5) and top 0.10% here | **42** |
-| `AGGRESSIVE_DRIVING` | ≥ 2 manoeuvres within 30 s of each other | one hard brake may be evasive; a second one seconds later is a pattern | 11 scenes |
+| `AGGRESSIVE_DRIVING` | ≥ 2 manoeuvres within 10 s of each other | one hard brake may be evasive; a second one seconds later is a pattern | 10 scenes |
 
 Every rule is guarded by `speed > 10 km/h`, which excludes parking-lot manoeuvres where large
 steering angles and small decelerations are normal.
@@ -116,10 +116,17 @@ of the single-bin accelerations were momentary spikes — road impact rather tha
 episode is stored once, with its duration and peak.
 
 Grouping them is a **session** rather than a fixed window. The question is whether two manoeuvres
-happened close together, but a tumbling window asks whether they fell in the same fixed 30-second
-box — and those differ: scene-0056's two manoeuvres are 12 seconds apart, yet a boundary landed
-between them and the rule missed a case it exists to catch. A session groups manoeuvres within
-30 s of each other and reports the span of the burst itself.
+happened close together, but a tumbling window asks whether they fell in the same fixed box — and
+those differ: scene-0056's two manoeuvres are 12 seconds apart, yet a boundary landed between them
+and the rule missed a case it exists to catch. A session asks the intended question and reports the
+burst's own extent.
+
+The 10-second gap comes from how manoeuvres actually cluster: of the 11 pairs sharing a scene,
+eight fall within 2 seconds of each other (median 1.7 s) — a brake followed by a swerve rather than
+two unrelated events. Any gap between 5 and 10 seconds selects the same 10 scenes, so the choice
+sits on a plateau rather than a knife edge, and beyond 15 seconds it stops constraining anything,
+since a scene is only 20 seconds long. Matching the window to the 20-second scene length would have
+been the wrong instinct: that number describes how the dataset was cut, not how driving behaves.
 
 One limitation is worth stating: an episode still in progress when a vehicle's stream ends is never
 emitted, because the pattern needs a row that breaks it to close. That is 3 of the 104 manoeuvres
@@ -142,11 +149,12 @@ Detection output is checked against expectations computed independently of the p
 rule logic is applied directly to the scene files, and the counts are compared with what the
 running cluster wrote to PostgreSQL.
 
-Running 8 scenes (1,546 records, staggered starts) through the cluster produced exactly the six
-manoeuvres computed offline for those scenes — one hard brake, two sharp turns, three harsh
-accelerations — each with the same duration, bin count and peak, plus the one truncated episode
-correctly absent. The session window flagged `scene-0056`, whose harsh acceleration and sharp turn
-fall 12 seconds apart, as aggressive driving.
+Running 8 scenes (1,551 records, staggered starts) through the cluster produced exactly the seven
+manoeuvres computed offline for those scenes, each with the same duration, bin count and peak, and
+the one truncated episode correctly absent. Two bursts were flagged: `scene-0203`, which
+accelerates hard and then brakes hard 4.7 seconds later, and `scene-0574`, which takes two sharp
+turns 1.3 seconds apart. `scene-0056` was correctly *not* flagged — its two manoeuvres are 12
+seconds apart, beyond the gap that defines a burst.
 
 Across all 979 scenes the rules select 104 manoeuvres in 92 scenes.
 

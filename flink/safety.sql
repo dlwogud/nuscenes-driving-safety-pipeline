@@ -207,22 +207,31 @@ FROM safety_episodes;
 -- crossings — a single corner wobbling across the line is no longer three events.
 --
 -- SESSION rather than TUMBLE. The intent is "two harsh manoeuvres close together",
--- but a tumbling window asks "two in the same fixed 30 s box", and those differ:
+-- but a tumbling window asks "two in the same fixed box", and those differ:
 -- scene-0056's two manoeuvres are 12 s apart yet a boundary fell between them, so
--- the rule missed a case it was written to catch. A session groups manoeuvres that
--- are within 30 s of each other, which is the question actually being asked, and
--- its start and end describe the burst instead of an arbitrary grid cell.
+-- the rule missed a case it was written to catch. A session asks the intended
+-- question, and its start and end describe the burst rather than a grid cell.
 --
--- Two is the threshold rather than three: a scene supplies about 20 s of driving,
--- so at three the rule fires on none of the 979 scenes. Two selects 11, the top 1.1%.
+-- The 10 s gap comes from how manoeuvres actually cluster here: of the 11 pairs
+-- that share a scene, eight are within 2 s of each other (median 1.7 s) — a brake
+-- followed by a swerve, not two unrelated events. Any gap from 5 to 10 s selects
+-- the same 10 scenes, so the choice sits on a plateau rather than a knife edge;
+-- beyond 15 s it stops constraining anything, because a scene is only 20 s long
+-- and every pair in it then qualifies regardless of spacing.
+--
+-- Two manoeuvres is the threshold rather than three: a scene supplies about 20 s
+-- of driving, so at three the rule fires on none of the 979 scenes.
 -- Grouped-window syntax rather than the TUMBLE(TABLE ...) table function: the
 -- newer form rejects a rowtime that has passed through MATCH_RECOGNIZE and
 -- UNION ALL, even though it still carries the ROWTIME marker.
 INSERT INTO driving_windows_sink
 SELECT
     vehicle_id,
-    SESSION_START(episode_end, INTERVAL '30' SECOND) AS window_start,
-    SESSION_END(episode_end, INTERVAL '30' SECOND)   AS window_end,
+    -- The burst's own extent, not SESSION_START/END: the session's end carries
+    -- the 10 s idle gap that closed it, which would overstate how long the
+    -- driving actually lasted.
+    MIN(episode_start) AS window_start,
+    MAX(episode_end)   AS window_end,
     SUM(CASE WHEN event_type = 'HARSH_BRAKE' THEN 1 ELSE 0 END) AS harsh_brakes,
     SUM(CASE WHEN event_type = 'SHARP_TURN'  THEN 1 ELSE 0 END) AS sharp_turns,
     SUM(CASE WHEN event_type = 'HARSH_ACCEL' THEN 1 ELSE 0 END) AS harsh_accels,
@@ -230,5 +239,5 @@ SELECT
     ROUND(AVG(entry_speed), 1)     AS avg_speed,
     'AGGRESSIVE_DRIVING'           AS flag
 FROM safety_episodes
-GROUP BY vehicle_id, SESSION(episode_end, INTERVAL '30' SECOND)
+GROUP BY vehicle_id, SESSION(episode_end, INTERVAL '10' SECOND)
 HAVING COUNT(*) >= 2;
