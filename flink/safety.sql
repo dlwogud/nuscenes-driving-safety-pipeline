@@ -45,8 +45,10 @@ CREATE TABLE vehicle_source (
     wheel_rpm_mean  DOUBLE,
     brake_sensor    DOUBLE,
     throttle_sensor DOUBLE,
-    -- event time comes from the record itself (µs -> ms), not from arrival time
-    event_ts AS TO_TIMESTAMP_LTZ(ts_us / 1000, 3),
+    -- Event time comes from the record itself (µs -> ms), not from arrival time.
+    -- Cast away the local time zone: TUMBLE rejects a TIMESTAMP_LTZ rowtime once
+    -- it has travelled through MATCH_RECOGNIZE and UNION ALL.
+    event_ts AS CAST(TO_TIMESTAMP_LTZ(ts_us / 1000, 3) AS TIMESTAMP(3)),
     -- 5 s grace: records later than this miss their window (see 사전 #6)
     WATERMARK FOR event_ts AS event_ts - INTERVAL '5' SECOND
 ) WITH (
@@ -99,6 +101,10 @@ CREATE TABLE driving_windows_sink (
 -- One row per braking manoeuvre. LAST(E.<col>, 1) is the previous row already
 -- matched to E: NULL on the first row, which is what makes the entry threshold
 -- apply only there and the weaker hold threshold apply afterwards.
+-- TERM is the first row that breaks the hold condition. Flink refuses a pattern
+-- ending in a greedy quantifier, so the episode has to be closed by a row that
+-- does not belong to it; that row can never start the next episode either,
+-- since failing the hold threshold also fails the stricter entry one.
 CREATE VIEW harsh_brake_episodes AS
 SELECT vehicle_id, 'HARSH_BRAKE' AS event_type,
        episode_start, episode_end, peak_value, bins, entry_speed
@@ -114,12 +120,15 @@ MATCH_RECOGNIZE (
         FIRST(E.speed_kmh)    AS entry_speed
     ONE ROW PER MATCH
     AFTER MATCH SKIP PAST LAST ROW
-    PATTERN (E{2,})
+    PATTERN (E{2,} TERM)
     DEFINE
         E AS E.speed_kmh > 10 AND (
                  (LAST(E.accel_lon_min, 1) IS NULL     AND E.accel_lon_min < -4.0)
               OR (LAST(E.accel_lon_min, 1) IS NOT NULL AND E.accel_lon_min < -3.0)
-             )
+             ),
+        TERM AS TERM.speed_kmh <= 10
+             OR TERM.accel_lon_min IS NULL
+             OR TERM.accel_lon_min >= -3.0
 );
 
 CREATE VIEW sharp_turn_episodes AS
@@ -137,12 +146,15 @@ MATCH_RECOGNIZE (
         FIRST(E.speed_kmh)         AS entry_speed
     ONE ROW PER MATCH
     AFTER MATCH SKIP PAST LAST ROW
-    PATTERN (E{2,})
+    PATTERN (E{2,} TERM)
     DEFINE
         E AS E.speed_kmh > 10 AND (
                  (LAST(E.accel_lat_max, 1) IS NULL     AND ABS(E.accel_lat_max) > 3.0)
               OR (LAST(E.accel_lat_max, 1) IS NOT NULL AND ABS(E.accel_lat_max) > 2.25)
-             )
+             ),
+        TERM AS TERM.speed_kmh <= 10
+             OR TERM.accel_lat_max IS NULL
+             OR ABS(TERM.accel_lat_max) <= 2.25
 );
 
 CREATE VIEW harsh_accel_episodes AS
@@ -160,12 +172,15 @@ MATCH_RECOGNIZE (
         FIRST(E.speed_kmh)    AS entry_speed
     ONE ROW PER MATCH
     AFTER MATCH SKIP PAST LAST ROW
-    PATTERN (E{2,})
+    PATTERN (E{2,} TERM)
     DEFINE
         E AS E.speed_kmh > 10 AND (
                  (LAST(E.accel_lon_max, 1) IS NULL     AND E.accel_lon_max > 2.5)
               OR (LAST(E.accel_lon_max, 1) IS NOT NULL AND E.accel_lon_max > 1.9)
-             )
+             ),
+        TERM AS TERM.speed_kmh <= 10
+             OR TERM.accel_lon_max IS NULL
+             OR TERM.accel_lon_max <= 1.9
 );
 
 CREATE VIEW safety_episodes AS
@@ -188,22 +203,32 @@ SELECT
     entry_speed
 FROM safety_episodes;
 
--- 30 s tumbling window per vehicle, now counting manoeuvres rather than bins:
--- three separate harsh manoeuvres inside 30 s is a driving pattern, whereas a
--- single corner that wobbles across the threshold is not.
+-- A burst of manoeuvres per vehicle, counted as manoeuvres rather than threshold
+-- crossings — a single corner wobbling across the line is no longer three events.
+--
+-- SESSION rather than TUMBLE. The intent is "two harsh manoeuvres close together",
+-- but a tumbling window asks "two in the same fixed 30 s box", and those differ:
+-- scene-0056's two manoeuvres are 12 s apart yet a boundary fell between them, so
+-- the rule missed a case it was written to catch. A session groups manoeuvres that
+-- are within 30 s of each other, which is the question actually being asked, and
+-- its start and end describe the burst instead of an arbitrary grid cell.
+--
+-- Two is the threshold rather than three: a scene supplies about 20 s of driving,
+-- so at three the rule fires on none of the 979 scenes. Two selects 11, the top 1.1%.
+-- Grouped-window syntax rather than the TUMBLE(TABLE ...) table function: the
+-- newer form rejects a rowtime that has passed through MATCH_RECOGNIZE and
+-- UNION ALL, even though it still carries the ROWTIME marker.
 INSERT INTO driving_windows_sink
 SELECT
     vehicle_id,
-    window_start,
-    window_end,
+    SESSION_START(episode_end, INTERVAL '30' SECOND) AS window_start,
+    SESSION_END(episode_end, INTERVAL '30' SECOND)   AS window_end,
     SUM(CASE WHEN event_type = 'HARSH_BRAKE' THEN 1 ELSE 0 END) AS harsh_brakes,
     SUM(CASE WHEN event_type = 'SHARP_TURN'  THEN 1 ELSE 0 END) AS sharp_turns,
     SUM(CASE WHEN event_type = 'HARSH_ACCEL' THEN 1 ELSE 0 END) AS harsh_accels,
     COUNT(*)                       AS episode_cnt,
     ROUND(AVG(entry_speed), 1)     AS avg_speed,
     'AGGRESSIVE_DRIVING'           AS flag
-FROM TABLE(
-    TUMBLE(TABLE safety_episodes, DESCRIPTOR(episode_end), INTERVAL '30' SECOND)
-)
-GROUP BY vehicle_id, window_start, window_end
-HAVING COUNT(*) >= 3;
+FROM safety_episodes
+GROUP BY vehicle_id, SESSION(episode_end, INTERVAL '30' SECOND)
+HAVING COUNT(*) >= 2;

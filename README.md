@@ -5,12 +5,12 @@ scenes recorded by Motional's Renault Zoe AV fleet ([nuScenes CAN bus expansion]
 
 The four CAN channels that carry driving dynamics — sampled anywhere between **2 Hz and 950 Hz** —
 are unified onto a common 10 Hz stream, validated, replayed into Kafka at their original pace, and
-analysed by Flink SQL — both event-level rules and 30-second tumbling windows — with results
-landing in PostgreSQL.
+analysed by Flink SQL, which recognises each harsh manoeuvre as a single episode and groups
+manoeuvres that cluster in time — with results landing in PostgreSQL.
 
 > 실제 자율주행 차량에서 수집한 nuScenes CAN 버스 데이터 기반 실시간 주행 안전성 분석 파이프라인.
 > 2Hz~950Hz로 주파수가 제각각인 CAN 채널을 10Hz로 통합·검증한 뒤 Kafka로 재생하고, Flink SQL로 급제동·
-> 급선회·페달 오조작을 탐지하며 30초 윈도우로 난폭운전 패턴까지 집계합니다.
+> 급선회·급가속을 '사건' 단위로 탐지하고, 짧은 시간에 몰린 사건들을 묶어 난폭운전 패턴까지 집계합니다.
 
 | Scenes | Records validated | Quarantined to DLQ | Sample rates unified | Manoeuvres detected |
 |:--:|:--:|:--:|:--:|:--:|
@@ -38,12 +38,12 @@ The parsing bug also existed in this project's [predecessor](#prior-version) and
 ```mermaid
 flowchart LR
     subgraph P["producer (Python)"]
-        A["scene_loader<br/>7 channels → 10 Hz"] --> B["validator<br/>quality gate"]
+        A["scene_loader<br/>4 channels → 10 Hz"] --> B["validator<br/>quality gate"]
         B --> C["replay_producer<br/>original pace, staggered"]
     end
     C -->|"vehicle-can-data<br/>key = vehicle_id"| K["Kafka<br/>3 partitions"]
     C -->|"vehicle-can-dlq<br/>+ reasons"| K
-    K --> F["Flink SQL<br/>event rules + 30s TUMBLE"]
+    K --> F["Flink SQL<br/>MATCH_RECOGNIZE episodes<br/>+ session window"]
     F --> D[("PostgreSQL<br/>safety_events<br/>driving_windows")]
 ```
 
@@ -103,7 +103,7 @@ Entry thresholds are quoted from vehicle dynamics rather than invented, then che
 | `HARSH_BRAKE` | `accel_lon_min < −4.0 m/s²` | comfortable braking sits near 2.5 m/s²; 4 m/s² (0.4 G) is a genuine hard stop — top 0.12% | **15** |
 | `SHARP_TURN` | `abs(accel_lat_max) > 3.0 m/s²` | lateral acceleration already encodes speed × curvature, so it beats steering angle alone — top 0.10% | **47** |
 | `HARSH_ACCEL` | `accel_lon_max > 2.5 m/s²` | low end of the industry harsh-acceleration range (2.5–3.5) and top 0.10% here | **42** |
-| `AGGRESSIVE_DRIVING` | ≥ 3 manoeuvres in one 30 s window | one hard brake may be evasive; three separate manoeuvres in 30 seconds is a pattern | 1 scene |
+| `AGGRESSIVE_DRIVING` | ≥ 2 manoeuvres within 30 s of each other | one hard brake may be evasive; a second one seconds later is a pattern | 11 scenes |
 
 Every rule is guarded by `speed > 10 km/h`, which excludes parking-lot manoeuvres where large
 steering angles and small decelerations are normal.
@@ -114,6 +114,17 @@ times. Each rule is therefore evaluated as an *episode*: `MATCH_RECOGNIZE` enter
 above, holds while the signal stays past 75% of it, and requires at least two bins, since over half
 of the single-bin accelerations were momentary spikes — road impact rather than driving. Each
 episode is stored once, with its duration and peak.
+
+Grouping them is a **session** rather than a fixed window. The question is whether two manoeuvres
+happened close together, but a tumbling window asks whether they fell in the same fixed 30-second
+box — and those differ: scene-0056's two manoeuvres are 12 seconds apart, yet a boundary landed
+between them and the rule missed a case it exists to catch. A session groups manoeuvres within
+30 s of each other and reports the span of the burst itself.
+
+One limitation is worth stating: an episode still in progress when a vehicle's stream ends is never
+emitted, because the pattern needs a row that breaks it to close. That is 3 of the 104 manoeuvres
+here (2.9%), and those are truncated in the recording as well — the scene ends mid-corner, so their
+duration and peak are unknown anyway. A continuously flowing stream does not have this boundary.
 
 The two-bin floor is a definition rather than a noise filter, and worth stating precisely because
 the obvious explanation turned out to be wrong. Single-bin crossings looked like road impact, but
@@ -131,13 +142,17 @@ Detection output is checked against expectations computed independently of the p
 rule logic is applied directly to the scene files, and the counts are compared with what the
 running cluster wrote to PostgreSQL.
 
-Running that way on 15 scenes (2,905 records, staggered starts) reproduced the expected counts
-exactly — 2 hard brakes, 3 sharp turns, 5 of the since-removed pedal rule — which is what surfaced
-the inflation problem: the expectation and the pipeline agreed with each other while both counted
-threshold crossings rather than manoeuvres.
+Running 8 scenes (1,546 records, staggered starts) through the cluster produced exactly the six
+manoeuvres computed offline for those scenes — one hard brake, two sharp turns, three harsh
+accelerations — each with the same duration, bin count and peak, plus the one truncated episode
+correctly absent. The session window flagged `scene-0056`, whose harsh acceleration and sharp turn
+fall 12 seconds apart, as aggressive driving.
 
-The episode rules above are measured across all 979 scenes (104 manoeuvres in 92 scenes);
-re-running the cluster against those figures is the next step.
+Across all 979 scenes the rules select 104 manoeuvres in 92 scenes.
+
+Restarting the job re-reads the topic from its earliest offset, so re-running against an existing
+topic duplicates rows: the JDBC sink has no key and no idempotency. That is expected here and is
+the subject of the next phase.
 
 The windowed aggregation flagged `scene-0308`, whose three sharp turns fall inside one 30-second
 window, as `AGGRESSIVE_DRIVING`. Two window rows were written rather than one: the second was a
