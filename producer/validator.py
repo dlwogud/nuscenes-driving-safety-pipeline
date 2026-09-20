@@ -13,7 +13,20 @@ import json
 import sys
 from collections import Counter
 
-REQUIRED_FIELDS = ("vehicle_id", "ts_us", "speed_kmh", "accel_lon", "steering_deg")
+# What the pipeline downstream cannot work without, kept in step with the rules in
+# flink/safety.sql: a field no rule reads has no business quarantining a record,
+# and a field every rule reads must not be allowed through missing. The loader
+# happens to emit each of these alongside the fields it is grouped with, so the
+# older list was correct by accident; stating the real dependency means a change
+# to either side shows up here rather than silently disarming a rule.
+REQUIRED_FIELDS = (
+    "vehicle_id",     # Kafka key, and what Flink partitions and orders by
+    "ts_us",          # event time — no timestamp, no window
+    "speed_kmh",      # the speed guard every rule applies
+    "accel_lon_min",  # HARSH_BRAKE tests this
+    "accel_lon_max",  # HARSH_ACCEL tests this
+    "accel_lat_max",  # SHARP_TURN tests this
+)
 
 # Renault Zoe: ~1.94 m tire circumference -> wheel rpm 165 ≈ 19 km/h
 KMH_PER_RPM = 1.94 * 60 / 1000

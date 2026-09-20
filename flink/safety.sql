@@ -28,6 +28,11 @@
 -- and showing no speed gain at all in half of the cases.
 -- speed > 10 km/h guards exclude parking-lot manoeuvres throughout.
 
+-- Only speed_kmh, accel_lon_min, accel_lon_max and accel_lat_max are read by the
+-- rules below. The remaining columns are declared so the record keeps describing
+-- the vehicle's state rather than just the current rule set: they are what makes
+-- a quarantined record readable, and what a new rule would otherwise have to be
+-- threaded back through the loader and this schema to obtain.
 CREATE TABLE vehicle_source (
     vehicle_id      STRING,
     ts_us           BIGINT,

@@ -80,6 +80,12 @@ def load_scene(scene: str) -> list[dict]:
         if not imu_bins[i] and not veh_bins[i]:
             continue  # trailing/leading gap with no fast-channel data
 
+        # A record describes the vehicle's state, not just what the current rules
+        # happen to test. Only speed_kmh, accel_lon_min, accel_lon_max and
+        # accel_lat_max are read by flink/safety.sql today; the rest are carried
+        # deliberately, because a quarantined record is unreadable without the
+        # surrounding context, and because adding a rule should not mean
+        # threading a new field back through the loader, the schema and the SQL.
         ts_us = start_us + i * BIN_US
         rec: dict = {
             "vehicle_id": scene,
