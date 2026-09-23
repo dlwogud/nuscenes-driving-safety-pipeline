@@ -27,6 +27,8 @@ from validator import validate_stream
 MAIN_TOPIC = "vehicle-can-data"
 DLQ_TOPIC = "vehicle-can-dlq"
 BOOTSTRAP = "localhost:29092"
+DRY_RUN_SAMPLE = 5  # messages printed in a dry run, enough to eyeball the shape
+LATE_TOLERANCE_S = 0.001  # a message this far past its slot counts as falling behind
 
 
 def scene_timeline(scene: str, now_us: int, offset_s: float = 0.0):
@@ -78,25 +80,53 @@ def replay(scenes: list[str], speed: float, dry_run: bool, stagger: float = 0.0)
         )
 
     sent = {MAIN_TOPIC: 0, DLQ_TOPIC: 0}
+    printed = 0   # dry-run sample lines; kept apart from `sent`, which reports totals
+    behind = 0    # messages whose slot had already passed when they were sent
+    first_rel = last_rel = None
     t0 = time.monotonic()
     for rel_s, topic, payload in merged:
-        wait = rel_s / speed - (time.monotonic() - t0)
-        if wait > 0:
-            time.sleep(wait)
+        if first_rel is None:
+            first_rel = rel_s
+        last_rel = rel_s
+
+        # A dry run reports what would be sent; making it wait out the recording
+        # would cost 20 s per scene to print a handful of lines.
+        if not dry_run:
+            wait = rel_s / speed - (time.monotonic() - t0)
+            if wait > 0:
+                time.sleep(wait)
+            elif wait < -LATE_TOLERANCE_S:
+                behind += 1
 
         key = payload["vehicle_id"] if topic == MAIN_TOPIC else payload["record"]["vehicle_id"]
-        if producer:
+        if dry_run:
+            if printed < DRY_RUN_SAMPLE:
+                print(f"[dry-run] {rel_s:7.3f}s {topic} key={key} {json.dumps(payload)[:110]}")
+                printed += 1
+        else:
             producer.send(topic, key=key, value=payload)
-        elif sent[MAIN_TOPIC] + sent[DLQ_TOPIC] < 5:
-            print(f"[dry-run] {rel_s:7.3f}s {topic} key={key} {json.dumps(payload)[:110]}")
         sent[topic] += 1
 
     if producer:
         producer.flush()
         producer.close()
+
     took = time.monotonic() - t0
-    print(f"replayed {len(scenes)} scene(s) in {took:.1f}s (x{speed}): "
-          f"main={sent[MAIN_TOPIC]} dlq={sent[DLQ_TOPIC]}")
+    span = (last_rel - first_rel) if first_rel is not None else 0.0
+    totals = f"main={sent[MAIN_TOPIC]} dlq={sent[DLQ_TOPIC]}"
+    if dry_run:
+        print(f"[dry-run] {len(scenes)} scene(s), {totals} — {span:.1f}s of event time, "
+              f"{span / speed:.1f}s of wall clock at x{speed}")
+        return
+
+    # Requesting a speed the producer cannot sustain is silent otherwise: the
+    # wait simply goes negative and the run reports the speed it was asked for.
+    achieved = span / took if took > 0 else 0.0
+    print(f"replayed {len(scenes)} scene(s) in {took:.1f}s "
+          f"(x{speed} requested, x{achieved:.0f} achieved): {totals}")
+    if behind and achieved < speed * 0.8:
+        print(f"  ! fell behind on {behind} of {sum(sent.values())} messages — "
+              f"x{speed} is beyond what this producer sustains here")
 
 
 def main() -> None:
