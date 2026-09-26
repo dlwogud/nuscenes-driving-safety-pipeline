@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS driving_windows (
     sharp_turns  BIGINT,
     harsh_accels BIGINT,
     episode_cnt  BIGINT,
-    avg_speed    DOUBLE PRECISION,
+    avg_entry_speed DOUBLE PRECISION,
     flag         TEXT
 );
 

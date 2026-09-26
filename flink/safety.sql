@@ -92,7 +92,7 @@ CREATE TABLE driving_windows_sink (
     sharp_turns  BIGINT,
     harsh_accels BIGINT,
     episode_cnt  BIGINT,
-    avg_speed    DOUBLE,
+    avg_entry_speed DOUBLE,
     flag         STRING
 ) WITH (
     'connector' = 'jdbc',
@@ -226,6 +226,7 @@ FROM safety_episodes;
 --
 -- Two manoeuvres is the threshold rather than three: a scene supplies about 20 s
 -- of driving, so at three the rule fires on none of the 979 scenes.
+--
 -- Grouped-window syntax rather than the TUMBLE(TABLE ...) table function: the
 -- newer form rejects a rowtime that has passed through MATCH_RECOGNIZE and
 -- UNION ALL, even though it still carries the ROWTIME marker.
@@ -241,7 +242,9 @@ SELECT
     SUM(CASE WHEN event_type = 'SHARP_TURN'  THEN 1 ELSE 0 END) AS sharp_turns,
     SUM(CASE WHEN event_type = 'HARSH_ACCEL' THEN 1 ELSE 0 END) AS harsh_accels,
     COUNT(*)                       AS episode_cnt,
-    ROUND(AVG(entry_speed), 1)     AS avg_speed,
+    -- Mean speed at which the manoeuvres were *entered*, not the mean speed
+    -- driven over the burst — the stream between manoeuvres is not aggregated here.
+    ROUND(AVG(entry_speed), 1)     AS avg_entry_speed,
     'AGGRESSIVE_DRIVING'           AS flag
 FROM safety_episodes
 GROUP BY vehicle_id, SESSION(episode_end, INTERVAL '10' SECOND)
