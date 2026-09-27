@@ -156,6 +156,11 @@ accelerates hard and then brakes hard 4.7 seconds later, and `scene-0574`, which
 turns 1.3 seconds apart. `scene-0056` was correctly *not* flagged — its two manoeuvres are 12
 seconds apart, beyond the gap that defines a burst.
 
+![The job running on the cluster](screenshots/flink-running-job.png)
+
+One Flink job, nine tasks, both sinks fed from a single read of the topic — the two INSERTs are
+submitted together as one StatementSet rather than as two jobs scanning Kafka twice.
+
 What the cluster wrote, verbatim:
 
 **`safety_events`** — one row per manoeuvre, with the extent and peak of each
