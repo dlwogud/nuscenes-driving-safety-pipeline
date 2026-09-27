@@ -103,6 +103,24 @@ CREATE TABLE driving_windows_sink (
     'driver' = 'org.postgresql.Driver'
 );
 
+-- Every threshold appears exactly once, here. Flink forbids a pattern that ends
+-- in a greedy quantifier, so each episode has to be closed by a TERM row, and
+-- DEFINE cannot refer to another variable's definition — which previously forced
+-- each hold threshold to be written twice, once to continue the episode and once
+-- to end it. Deciding entry and hold up front leaves the pattern to reference
+-- named booleans, so changing a threshold is a one-line change that cannot leave
+-- the two halves disagreeing. COALESCE keeps a null reading out of the pattern
+-- rather than letting three-valued logic stall it.
+CREATE VIEW flagged AS
+SELECT *,
+    COALESCE(speed_kmh > 10 AND accel_lon_min < -4.0,    FALSE) AS brake_entry,
+    COALESCE(speed_kmh > 10 AND accel_lon_min < -3.0,    FALSE) AS brake_hold,
+    COALESCE(speed_kmh > 10 AND ABS(accel_lat_max) > 3.0,  FALSE) AS turn_entry,
+    COALESCE(speed_kmh > 10 AND ABS(accel_lat_max) > 2.25, FALSE) AS turn_hold,
+    COALESCE(speed_kmh > 10 AND accel_lon_max > 2.5,     FALSE) AS accel_entry,
+    COALESCE(speed_kmh > 10 AND accel_lon_max > 1.9,     FALSE) AS accel_hold
+FROM vehicle_source;
+
 -- One row per braking manoeuvre. LAST(E.<col>, 1) is the previous row already
 -- matched to E: NULL on the first row, which is what makes the entry threshold
 -- apply only there and the weaker hold threshold apply afterwards.
@@ -113,7 +131,7 @@ CREATE TABLE driving_windows_sink (
 CREATE VIEW harsh_brake_episodes AS
 SELECT vehicle_id, 'HARSH_BRAKE' AS event_type,
        episode_start, episode_end, peak_value, bins, entry_speed
-FROM vehicle_source
+FROM flagged
 MATCH_RECOGNIZE (
     PARTITION BY vehicle_id
     ORDER BY event_ts
@@ -127,19 +145,19 @@ MATCH_RECOGNIZE (
     AFTER MATCH SKIP PAST LAST ROW
     PATTERN (E{2,} TERM)
     DEFINE
-        E AS E.speed_kmh > 10 AND (
-                 (LAST(E.accel_lon_min, 1) IS NULL     AND E.accel_lon_min < -4.0)
-              OR (LAST(E.accel_lon_min, 1) IS NOT NULL AND E.accel_lon_min < -3.0)
-             ),
-        TERM AS TERM.speed_kmh <= 10
-             OR TERM.accel_lon_min IS NULL
-             OR TERM.accel_lon_min >= -3.0
+        -- First row of the match: LAST(...) must read a nullable column, not a
+        -- boolean — on a boolean the missing offset comes back FALSE rather than
+        -- NULL, so the test silently fails and every episode starts on the hold
+        -- threshold instead of the entry one.
+        E AS (LAST(E.accel_lon_min, 1) IS NULL     AND E.brake_entry)
+          OR (LAST(E.accel_lon_min, 1) IS NOT NULL AND E.brake_hold),
+        TERM AS NOT TERM.brake_hold
 );
 
 CREATE VIEW sharp_turn_episodes AS
 SELECT vehicle_id, 'SHARP_TURN' AS event_type,
        episode_start, episode_end, peak_value, bins, entry_speed
-FROM vehicle_source
+FROM flagged
 MATCH_RECOGNIZE (
     PARTITION BY vehicle_id
     ORDER BY event_ts
@@ -153,19 +171,19 @@ MATCH_RECOGNIZE (
     AFTER MATCH SKIP PAST LAST ROW
     PATTERN (E{2,} TERM)
     DEFINE
-        E AS E.speed_kmh > 10 AND (
-                 (LAST(E.accel_lat_max, 1) IS NULL     AND ABS(E.accel_lat_max) > 3.0)
-              OR (LAST(E.accel_lat_max, 1) IS NOT NULL AND ABS(E.accel_lat_max) > 2.25)
-             ),
-        TERM AS TERM.speed_kmh <= 10
-             OR TERM.accel_lat_max IS NULL
-             OR ABS(TERM.accel_lat_max) <= 2.25
+        -- First row of the match: LAST(...) must read a nullable column, not a
+        -- boolean — on a boolean the missing offset comes back FALSE rather than
+        -- NULL, so the test silently fails and every episode starts on the hold
+        -- threshold instead of the entry one.
+        E AS (LAST(E.accel_lat_max, 1) IS NULL     AND E.turn_entry)
+          OR (LAST(E.accel_lat_max, 1) IS NOT NULL AND E.turn_hold),
+        TERM AS NOT TERM.turn_hold
 );
 
 CREATE VIEW harsh_accel_episodes AS
 SELECT vehicle_id, 'HARSH_ACCEL' AS event_type,
        episode_start, episode_end, peak_value, bins, entry_speed
-FROM vehicle_source
+FROM flagged
 MATCH_RECOGNIZE (
     PARTITION BY vehicle_id
     ORDER BY event_ts
@@ -179,13 +197,13 @@ MATCH_RECOGNIZE (
     AFTER MATCH SKIP PAST LAST ROW
     PATTERN (E{2,} TERM)
     DEFINE
-        E AS E.speed_kmh > 10 AND (
-                 (LAST(E.accel_lon_max, 1) IS NULL     AND E.accel_lon_max > 2.5)
-              OR (LAST(E.accel_lon_max, 1) IS NOT NULL AND E.accel_lon_max > 1.9)
-             ),
-        TERM AS TERM.speed_kmh <= 10
-             OR TERM.accel_lon_max IS NULL
-             OR TERM.accel_lon_max <= 1.9
+        -- First row of the match: LAST(...) must read a nullable column, not a
+        -- boolean — on a boolean the missing offset comes back FALSE rather than
+        -- NULL, so the test silently fails and every episode starts on the hold
+        -- threshold instead of the entry one.
+        E AS (LAST(E.accel_lon_max, 1) IS NULL     AND E.accel_entry)
+          OR (LAST(E.accel_lon_max, 1) IS NOT NULL AND E.accel_hold),
+        TERM AS NOT TERM.accel_hold
 );
 
 CREATE VIEW safety_episodes AS
