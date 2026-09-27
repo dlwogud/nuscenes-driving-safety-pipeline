@@ -156,16 +156,36 @@ accelerates hard and then brakes hard 4.7 seconds later, and `scene-0574`, which
 turns 1.3 seconds apart. `scene-0056` was correctly *not* flagged — its two manoeuvres are 12
 seconds apart, beyond the gap that defines a burst.
 
+What the cluster wrote, verbatim:
+
+**`safety_events`** — one row per manoeuvre, with the extent and peak of each
+
+| vehicle_id | event_type | duration_s | peak | bins |
+|---|---|--:|--:|--:|
+| scene-0056 | HARSH_ACCEL | 0.9 | 3.65 | 9 |
+| scene-0056 | SHARP_TURN | 0.4 | 3.05 | 4 |
+| scene-0203 | HARSH_ACCEL | 0.6 | 3.35 | 6 |
+| scene-0203 | HARSH_BRAKE | 0.9 | −4.28 | 9 |
+| scene-0532 | HARSH_BRAKE | 0.8 | −4.06 | 8 |
+| scene-0574 | SHARP_TURN | 0.2 | 3.43 | 2 |
+| scene-0574 | SHARP_TURN | 0.2 | 3.34 | 2 |
+
+**`driving_windows`** — bursts of manoeuvres close together in time
+
+| vehicle_id | harsh_brakes | sharp_turns | harsh_accels | episode_cnt | avg_entry_speed | flag |
+|---|--:|--:|--:|--:|--:|---|
+| scene-0203 | 1 | 0 | 1 | 2 | 19.2 | AGGRESSIVE_DRIVING |
+| scene-0574 | 0 | 2 | 0 | 2 | 17.5 | AGGRESSIVE_DRIVING |
+
+`scene-0532` has a hard brake but only one manoeuvre, and a single hard brake may be evasive
+rather than a pattern. `scene-0056` has two, but 12 seconds apart — the gap rule is what separates
+a burst from two unrelated events, and both non-detections are it working.
+
 Across all 979 scenes the rules select 104 manoeuvres in 92 scenes.
 
 Restarting the job re-reads the topic from its earliest offset, so re-running against an existing
 topic duplicates rows: the JDBC sink has no key and no idempotency. That is expected here and is
 the subject of the next phase.
-
-The windowed aggregation flagged `scene-0308`, whose three sharp turns fall inside one 30-second
-window, as `AGGRESSIVE_DRIVING`. Two window rows were written rather than one: the second was a
-window left open by an earlier replay, released once the advancing watermark finally passed its
-end — see the engineering note below.
 
 ## Running it
 
