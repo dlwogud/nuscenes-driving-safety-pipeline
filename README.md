@@ -72,7 +72,25 @@ The validator rejects only what is **physically impossible** — a speed no Rena
 an acceleration beyond tyre-friction limits — and lets through everything that is merely
 *dangerous*, because deciding whether hard braking is real is the detector's job, not the
 validator's. Rejected records are not dropped: they go to a dead-letter topic with their reasons
-attached, so nothing disappears silently and the DLQ arrival rate doubles as a health signal.
+attached, so nothing disappears silently and a rejection can still be read back:
+
+```bash
+docker compose exec kafka kafka-console-consumer \
+  --bootstrap-server kafka:9092 --topic vehicle-can-dlq --from-beginning --max-messages 5
+```
+
+```json
+{"record": {"vehicle_id": "scene-0419", "ts_us": 1538034043820333, "speed_kmh": null,
+            "accel_lon_min": -1.1546, "wheel_rpm_mean": 233.02, "brake_sensor": 0.2915, ...},
+ "reasons": ["missing:speed_kmh"]}
+```
+
+The surrounding fields are why the quarantine is legible: the accelerometer, the wheels and the
+pedals all read normally, so this is a real drive with one channel missing rather than a corrupt
+record. Grouping the topic by vehicle makes the same point in aggregate — replaying `scene-0419`
+alongside two healthy scenes puts 199 of 200 rejections on that one vehicle, which is the shape a
+sensor fault takes. Alerting on that rate is monitoring work, and belongs to the next phase; what
+exists today is the record and the reason, kept where they can be queried.
 
 | Check | Rule |
 |---|---|
