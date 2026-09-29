@@ -267,12 +267,6 @@ leading comment lines are now skipped before classification.
 unable to coexist with any other project using the same names. Removing them lets Compose namespace
 containers per project.
 
-## Roadmap
-
-- [x] Phase 1 — unified multi-rate ingestion, quality gate with DLQ, safety rules, verified run
-- [ ] Phase 2 — checkpointing and exactly-once, deliberate failure-recovery experiments, cloud deployment, throughput and latency benchmarks
-- [ ] Phase 3 — lakehouse sink for full-resolution reprocessing, partition scaling and backpressure study
-
 ## Prior version
 
 [vehicle-streaming-anomaly-detection](https://github.com/dlwogud/vehicle-streaming-anomaly-detection)
