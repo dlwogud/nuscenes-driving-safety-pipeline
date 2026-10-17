@@ -43,7 +43,13 @@ public class DrivingSafetyJob {
         // A Kafka partition that stops receiving data would otherwise hold the
         // global watermark back forever (watermark = min across partitions), so
         // the last windows of a replay never close. Mark quiet partitions idle.
-        tableEnv.getConfig().set("table.exec.source.idle-timeout", "10 s");
+        // Overridable because it was the first suspect for the records dropped
+        // as late after a recovery, and turning it off changed nothing (1,778
+        // dropped against 1,853) — the cause was the watermark grace being
+        // narrower than the rewind. The knob stays so that result can be
+        // reproduced rather than taken on trust.
+        tableEnv.getConfig().set("table.exec.source.idle-timeout",
+                System.getenv().getOrDefault("IDLE_TIMEOUT", "10 s"));
 
         String sqlScript = Files.readString(SQL_FILE);
         List<String> insertStatements = new ArrayList<>();

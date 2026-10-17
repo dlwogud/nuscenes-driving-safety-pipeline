@@ -54,8 +54,17 @@ CREATE TABLE vehicle_source (
     -- Cast away the local time zone: TUMBLE rejects a TIMESTAMP_LTZ rowtime once
     -- it has travelled through MATCH_RECOGNIZE and UNION ALL.
     event_ts AS CAST(TO_TIMESTAMP_LTZ(ts_us / 1000, 3) AS TIMESTAMP(3)),
-    -- 5 s grace: records later than this miss their window (see 사전 #6)
-    WATERMARK FOR event_ts AS event_ts - INTERVAL '5' SECOND
+    -- Records later than this miss their window and are dropped silently
+    -- (see 사전 #6, #13). The grace is set by how far the stream can be rewound,
+    -- not by how out of order the sensors are: a recovery re-reads records the
+    -- watermark has already passed, and that rewind is bounded by the gap
+    -- between checkpoints — a 10 s interval plus a 5 s minimum pause, so up to
+    -- 15 s of event time is replayed after a failure. The original 5 s could
+    -- not cover it and dropped 1,778-1,909 records on every recovery under
+    -- load, losing the manoeuvre that straddled the crash; 30 s is twice the
+    -- worst-case rewind and dropped none. The cost is continuous: every window
+    -- now closes 30 s later than it otherwise would.
+    WATERMARK FOR event_ts AS event_ts - INTERVAL '30' SECOND
 ) WITH (
     'connector' = 'kafka',
     'topic' = 'vehicle-can-data',

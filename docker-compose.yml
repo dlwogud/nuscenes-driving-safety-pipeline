@@ -49,6 +49,10 @@ services:
       - ./flink/lib/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
       - ./checkpoints:/opt/flink/checkpoints
     environment:
+      # The job's main() runs here, so this is where its watermark settings are
+      # read. Overridable so the idleness behaviour can be A/B tested against a
+      # recorded failure rather than argued about.
+      IDLE_TIMEOUT: ${IDLE_TIMEOUT:-10 s}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         state.checkpoints.dir: file:///opt/flink/checkpoints

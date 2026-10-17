@@ -293,15 +293,63 @@ survive.
 
 ![Event-time lag and late records](screenshots/grafana-event-time.png)
 
-**An open finding.** The `numLateRecordsDropped` panel exists because records arriving after the
-watermark has passed their window are discarded with no error, no log line and no dead-letter
-entry. It immediately caught one: during the recovery burst, **1,867 of the 6,787 records read
-after the restart (27%) were dropped as late**, while the watermark lag spiked to 55 minutes. The
-duplicate-free recovery above was therefore also a lossy one. The cause is not yet established —
-`table.exec.source.idle-timeout`, added to stop a quiet partition from freezing the watermark, is
-the first suspect, since a partition excluded from the watermark and then resuming delivers records
-that are late by construction. Measuring that is the next piece of work, and it is recorded here
-rather than fixed quietly because the number is the only reason anyone knows.
+**The recovery was lossy, and only the metric said so.** Records arriving after the watermark has
+passed their window are discarded with no error, no log line and no dead-letter entry, so this
+panel is the only place the loss is visible at all. It caught one immediately: **1,867 of the
+6,787 records read after the restart were dropped as late**. The duplicate-free recovery described
+above was therefore also a lossy one.
+
+Finding the cause meant eliminating candidates rather than arguing about them:
+
+| Run | Late records |
+|---|--:|
+| Cold start reading an 18,571-record backlog, no producer | **0** |
+| Kill and recover with nothing being produced | **0** |
+| Kill and recover while the producer keeps writing | **1,853** |
+| The same, with `table.exec.source.idle-timeout` disabled | **1,778** |
+
+So it takes recovery *and* a live producer together, and idleness — the obvious suspect, being the
+one setting that lets a partition be left out of the watermark — is **not** it. Nor is anything
+else about the restore: Flink seeks each partition back to its checkpointed offset, reads exactly
+the 6,867 records between there and the end of the topic, and delivers every one of them to the
+pattern operators, which then judge 1,778 to be behind the watermark.
+
+Sampling the TaskManager once a second instead of once per scrape showed where they go. Every drop
+lands in the **first two seconds after the TaskManager rejoins**, and none afterwards:
+
+```
+clock      p0      p1      p2   watermark   late
+17:43:45  15906       0   14536  17:42:58      99   ← one partition not yet reading
+17:43:46  16511   19223   14549  17:43:40     296   ← watermark jumps 42 s in one second
+17:43:47  16550   19247   14561  17:43:41     296   ← and never increases again
+```
+
+**The watermark survives a restart; the read position does not.** Checkpoints are taken every 10 s
+with a 5 s minimum pause, so at the moment of a crash the stream has been consumed up to 15 s
+beyond the last checkpoint. Recovery rewinds the source to that checkpoint and re-reads those
+seconds — into an operator whose watermark is already past them. With a 5 s grace, the rewind is
+three times wider than the tolerance, and everything in the gap is classified as late.
+
+That makes the grace a function of the checkpoint settings rather than of the sensors. The sensors
+here are barely out of order at all; what the grace has to cover is the replay. Raising it to 30 s
+— twice the worst-case rewind — eliminates the loss, in paired runs under identical load:
+
+| Watermark grace | Late records (3 runs / 2 runs) | Manoeuvres recorded |
+|---|--:|--:|
+| 5 s | 1,853 · 1,778 · 1,909 | 26 |
+| 30 s | 0 · 0 | **27** |
+
+The missing manoeuvre is the whole point of the exercise. A 25% record loss cost only one event
+because the dropped records are *re-reads* of a window already processed and written before the
+crash, and the sink is idempotent — so almost all of that work survived in the database. The one
+casualty was the manoeuvre that straddled the crash: its earlier half was dropped on the replay,
+and a partial episode is no episode.
+
+This is paid for continuously — every window now closes 30 s later. A shorter checkpoint interval
+would narrow the rewind instead, at the cost of checkpointing more often, and the better answer
+would be to route late records somewhere rather than discard them, the way the validator's
+dead-letter topic does upstream. For a pipeline whose output is after-the-fact driving analysis
+rather than an intervention, latency is the cheaper thing to spend.
 
 ## Running it
 
