@@ -119,6 +119,40 @@ CREATE TABLE driving_windows_sink (
     'driver' = 'org.postgresql.Driver'
 );
 
+-- Records that reach a pattern operator behind the watermark are discarded
+-- there, raising numLateRecordsDropped and leaving nothing else behind — no
+-- error, no log line, and no copy of the record. The validator upstream already
+-- refuses to drop anything silently; this gives the detection stage the same
+-- property. A Kafka topic rather than a table, for the same reason the
+-- validator's rejects go to one: a quarantine you cannot replay is only a log.
+CREATE TABLE late_records_sink (
+    vehicle_id    STRING,
+    ts_us         BIGINT,
+    event_ts      TIMESTAMP(3),
+    watermark_at  TIMESTAMP(3),
+    -- Seconds, not milliseconds: TIMESTAMPDIFF has no finer unit, and claiming
+    -- a precision the value does not have would be worse than coarseness.
+    behind_s      BIGINT,
+    speed_kmh     DOUBLE,
+    accel_lon_min DOUBLE,
+    accel_lon_max DOUBLE,
+    accel_lat_max DOUBLE
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'vehicle-can-late',
+    'properties.bootstrap.servers' = 'kafka:9092',
+    'format' = 'json'
+);
+
+-- Flink SQL has no side output for late data — that exists only in the
+-- DataStream API — so lateness is tested explicitly instead.
+-- CURRENT_WATERMARK returns the watermark in force as the row is processed, and
+-- is NULL until the first one arrives, which keeps start-up rows out of the
+-- comparison rather than classifying them as late.
+CREATE VIEW late_arrivals AS
+SELECT *, CURRENT_WATERMARK(event_ts) AS wm
+FROM vehicle_source;
+
 -- Every threshold appears exactly once, here. Flink forbids a pattern that ends
 -- in a greedy quantifier, so each episode has to be closed by a TERM row, and
 -- DEFINE cannot refer to another variable's definition — which previously forced
@@ -283,3 +317,21 @@ SELECT
 FROM safety_episodes
 GROUP BY vehicle_id, SESSION(episode_end, INTERVAL '10' SECOND)
 HAVING COUNT(*) >= 2;
+
+-- Capture, not repair: the row still misses its window, but it survives where
+-- it can be inspected and replayed. behind_s is how far past the watermark it
+-- arrived, which is what distinguishes a grace that is merely tight from a
+-- stream that is genuinely out of order.
+INSERT INTO late_records_sink
+SELECT
+    vehicle_id,
+    ts_us,
+    event_ts,
+    wm AS watermark_at,
+    CAST(TIMESTAMPDIFF(SECOND, event_ts, wm) AS BIGINT) AS behind_s,
+    speed_kmh,
+    accel_lon_min,
+    accel_lon_max,
+    accel_lat_max
+FROM late_arrivals
+WHERE wm IS NOT NULL AND event_ts <= wm;

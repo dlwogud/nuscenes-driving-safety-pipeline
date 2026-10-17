@@ -346,10 +346,56 @@ casualty was the manoeuvre that straddled the crash: its earlier half was droppe
 and a partial episode is no episode.
 
 This is paid for continuously — every window now closes 30 s later. A shorter checkpoint interval
-would narrow the rewind instead, at the cost of checkpointing more often, and the better answer
-would be to route late records somewhere rather than discard them, the way the validator's
-dead-letter topic does upstream. For a pipeline whose output is after-the-fact driving analysis
-rather than an intervention, latency is the cheaper thing to spend.
+would narrow the rewind instead, at the cost of checkpointing more often; for a pipeline whose
+output is after-the-fact driving analysis rather than an intervention, latency is the cheaper
+thing to spend.
+
+### Catching and recovering what still gets through
+
+A wider grace narrows the door rather than closing it, and anything still dropped leaves no trace
+beyond a counter — while the validator one stage upstream refuses to discard anything silently.
+Flink SQL has no side output for late data (that exists only in the DataStream API, and
+`MATCH_RECOGNIZE` has no allowed-lateness either), so lateness is tested explicitly instead, using
+the same condition the pattern operator applies:
+
+```sql
+CREATE VIEW late_arrivals AS
+SELECT *, CURRENT_WATERMARK(event_ts) AS wm FROM vehicle_source;
+
+INSERT INTO late_records_sink               -- Kafka topic vehicle-can-late
+SELECT vehicle_id, ts_us, event_ts, wm AS watermark_at,
+       CAST(TIMESTAMPDIFF(SECOND, event_ts, wm) AS BIGINT) AS behind_s, ...
+FROM late_arrivals WHERE wm IS NOT NULL AND event_ts <= wm;
+```
+
+`CURRENT_WATERMARK` is NULL until the first watermark arrives, and the `IS NOT NULL` guard is what
+keeps start-up rows from being classified as late. A Kafka topic rather than a table, for the same
+reason the validator's rejects go to one: a quarantine that cannot be replayed is only a log.
+Forcing the failure again with the old 5 s grace, the pattern operators dropped 267 records and
+the topic received **exactly those 267**.
+
+Capturing is not repairing — the row has still missed its window. Nor can it simply be fed back
+in: its event time is unchanged, so it would be late again, and rebasing it to now would change
+`episode_start` and therefore its key, turning one manoeuvre into two. Repair is a **second pass**,
+and it works because of the idempotent key: the same input produces the same rows, so reprocessing
+overwrites rather than appends.
+
+Which is worth demonstrating rather than deducing. Crashing the job under three times the load
+dropped 2,282 records and left 39 manoeuvres in the database; re-running the job from the start of
+the topic, without clearing the table, brought back one:
+
+```
+restored          scene-0026 | HARSH_ACCEL | 09:34:47.943 UTC
+disturbed by the repair   none
+```
+
+The TaskManager was killed at 18:34:41 local — **09:34:41 UTC**. The manoeuvre that came back began
+six seconds into the outage: produced while nothing was consuming, re-read on recovery, and
+discarded as late. Prevention, capture and repair each measured rather than assumed.
+
+In production the repair would read from `scan.startup.mode = specific-offsets` rather than
+reprocessing the whole topic — the earliest `ts_us` in the late topic is precisely the point to
+rewind to.
 
 ## Running it
 

@@ -12,7 +12,10 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 JAR_NAME = "driving-safety-job.jar"
-TOPICS = ("vehicle-can-data", "vehicle-can-dlq")
+# vehicle-can-late is written by the Flink job rather than by the producer:
+# records that reach the pattern operators behind the watermark are discarded
+# there, and a count is all that would otherwise survive of them.
+TOPICS = ("vehicle-can-data", "vehicle-can-dlq", "vehicle-can-late")
 
 
 def run_command(command: list[str]) -> int:
