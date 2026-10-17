@@ -45,7 +45,15 @@ flowchart LR
     C -->|"vehicle-can-dlq<br/>+ reasons"| K
     K --> F["Flink SQL<br/>MATCH_RECOGNIZE episodes<br/>+ session window"]
     F --> D[("PostgreSQL<br/>safety_events<br/>driving_windows")]
+    F -. "scraped" .-> M["Prometheus<br/>+ alert rules"]
+    K -. "committed offsets" .-> X["kafka-exporter"]
+    X -. "scraped" .-> M
+    M --> G["Grafana"]
 ```
+
+The metrics path is dotted because nothing in it carries data — and `kafka-exporter` hangs off
+Kafka rather than off Flink on purpose, so that lag is still observable when Flink is the thing
+that has failed.
 
 ## The data
 
@@ -89,8 +97,9 @@ The surrounding fields are why the quarantine is legible: the accelerometer, the
 pedals all read normally, so this is a real drive with one channel missing rather than a corrupt
 record. Grouping the topic by vehicle makes the same point in aggregate — replaying `scene-0419`
 alongside two healthy scenes puts 199 of 200 rejections on that one vehicle, which is the shape a
-sensor fault takes. Alerting on that rate is monitoring work, and belongs to the next phase; what
-exists today is the record and the reason, kept where they can be queried.
+sensor fault takes. The DLQ rate is not yet wired to an alert of its own — see
+[Watching it](#watching-it) for what is; what exists here is the record and the reason, kept where
+they can be queried.
 
 | Check | Rule |
 |---|---|
@@ -206,9 +215,93 @@ a burst from two unrelated events, and both non-detections are it working.
 
 Across all 979 scenes the rules select 104 manoeuvres in 92 scenes.
 
-Restarting the job re-reads the topic from its earliest offset, so re-running against an existing
-topic duplicates rows: the JDBC sink has no key and no idempotency. That is expected here and is
-the subject of the next phase.
+## Surviving failure
+
+Correct output from a pipeline that stops at the first crash is not much of a pipeline, so the
+TaskManager was killed mid-replay and the result compared against a baseline of 7 events and
+2 windows. Three configurations, three different kinds of wrong:
+
+| | Checkpointing off | Checkpointing on, no key | Checkpointing on, key |
+|---|---|---|---|
+| After the kill | **job dies outright** | recovers | recovers |
+| Kafka offsets | **consumer group never existed** | committed | committed |
+| Rows in PostgreSQL | — | **14 and 4 — exactly double** | **7 and 2** |
+
+**Without checkpoints there is nothing to recover to**, and Flink says so by refusing to restart at
+all (`NoRestartBackoffTimeStrategy`). Offsets are committed only when a checkpoint succeeds, so
+with checkpointing off the consumer group is never created — there is no record of how far the job
+read, and resuming anywhere would be a guess.
+
+**`EXACTLY_ONCE` was already set when the output doubled.** The guarantee covers Flink's own state:
+on recovery it rewinds and reprocesses, but rows already written to PostgreSQL cannot be rewound.
+End-to-end, a sink has to either join the checkpoint's two-phase commit or be idempotent.
+
+The replayed rows turned out to be identical in *every* column and not merely in their key, so
+reprocessing is deterministic and idempotency is enough. A primary key is declared on both sides —
+`NOT ENFORCED` in Flink, so the JDBC connector switches from `INSERT` to upsert, and as a real
+constraint in PostgreSQL, so there is something to conflict on:
+
+```sql
+PRIMARY KEY (vehicle_id, event_type, episode_start)
+```
+
+Each part comes from the data's own event time, never from when a record happened to be processed.
+That is what makes the key stable across a replay; a processing timestamp or a generated id would
+produce a *new* key for the same manoeuvre and silently reinstate the duplicates.
+
+One thing the restart strategy does not do is restore the machine. With the TaskManager gone the
+job retried against zero slots until its attempts ran out — in production a resource manager
+replaces the lost worker, and here `restart: unless-stopped` stands in for one.
+
+## Watching it
+
+The Flink UI shows the present moment, keeps no history, and is served by the JobManager — so it
+disappears at exactly the moment it is wanted. The failures above were noticed only because they
+were deliberate. Prometheus scrapes each process and Grafana renders the result; the direction
+matters, because a refused scrape is recorded as `up = 0`, whereas a reporter that pushes nothing
+looks the same as one with nothing to say.
+
+![Liveness and consumer lag through a TaskManager failure](screenshots/grafana-liveness-and-lag.png)
+
+The lag panel draws the same quantity twice, and the gap between the two lines is the point. The
+green series is published by the Kafka consumer *inside* the job and stops the instant the job
+does; the yellow one is read from the broker and climbs to ~6,800 records while Flink has nothing
+to say at all. Ten seconds after the TaskManager re-registered, it is back to zero.
+
+![Checkpoints and backpressure](screenshots/grafana-checkpoints-and-backpressure.png)
+
+Checkpoint size falling to zero and recovering is the restart; the burst of busy time just after it
+is the backlog being absorbed. Checkpoints themselves cost ~27 ms and ~150 KB — the only state is
+in-flight `MATCH_RECOGNIZE` matches and session-window buffers.
+
+**Then the alerts were tested against the same kill, which found two holes in them.**
+
+| What was wrong | Evidence | Fix |
+|---|---|---|
+| The liveness alert **could not fire** for a TaskManager | `up` read `1 1 1 1 0` and the series then *ended*, while the statically configured JobManager kept recording `0 0 0` | DNS discovery deletes a target as soon as its container is gone, so `up == 0 for 30s` never accumulates — `absent(up{job="flink-taskmanager"})` asks a question that survives the deletion, and now fires 20 s after the kill |
+| Every signal was published by the system being watched | the JobManager only noticed its missing TaskManager after the 50 s heartbeat timeout, and when it later exhausted its restart attempts and exited, the checkpoint alerts went with it | `kafka-exporter` reads committed offsets from the broker, so lag is still measurable when Flink is not running |
+
+![Alerts firing during the failure](screenshots/prometheus-alerts-firing.png)
+
+`FlinkProcessUnreachable` sitting at 0 active directly above `NoTaskManagerTargets` at 1 is the
+same outage seen by the rule that cannot express it and the rule that can.
+
+Detection is layered deliberately, because the fastest signal and the most trustworthy one are not
+the same: a failed scrape shows up in **5 s**, the derived alert fires at **20 s**, the JobManager's
+own heartbeat notices at **50 s**, and the broker-side lag keeps rising whether or not any of them
+survive.
+
+![Event-time lag and late records](screenshots/grafana-event-time.png)
+
+**An open finding.** The `numLateRecordsDropped` panel exists because records arriving after the
+watermark has passed their window are discarded with no error, no log line and no dead-letter
+entry. It immediately caught one: during the recovery burst, **1,867 of the 6,787 records read
+after the restart (27%) were dropped as late**, while the watermark lag spiked to 55 minutes. The
+duplicate-free recovery above was therefore also a lossy one. The cause is not yet established —
+`table.exec.source.idle-timeout`, added to stop a quiet partition from freezing the watermark, is
+the first suspect, since a partition excluded from the watermark and then resuming delivers records
+that are late by construction. Measuring that is the next piece of work, and it is recorded here
+rather than fixed quietly because the number is the only reason anyone knows.
 
 ## Running it
 
@@ -225,7 +318,8 @@ python3 flink/job.py                            # build the jar, start the clust
 python3 producer/replay_producer.py --count 15 --speed 15
 ```
 
-Flink UI: http://localhost:8081 · Results:
+Flink UI: http://localhost:8081 · Grafana: http://localhost:3000 (no login) ·
+Prometheus alerts: http://localhost:9090/alerts · Results:
 
 ```bash
 docker compose exec postgres psql -U flinkuser -d vehicle_db \
