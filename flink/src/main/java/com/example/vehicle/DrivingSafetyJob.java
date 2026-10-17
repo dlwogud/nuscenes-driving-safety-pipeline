@@ -5,6 +5,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.StatementSet;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
@@ -16,10 +18,27 @@ public class DrivingSafetyJob {
         EnvironmentSettings settings = EnvironmentSettings.newInstance()
                 .inStreamingMode()
                 .build();
-        StreamTableEnvironment tableEnv = StreamTableEnvironment.create(
-                org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
-                        .getExecutionEnvironment(),
-                settings);
+        // Without checkpointing Flink also switches restarts off, so losing a
+        // TaskManager kills the job outright — and since offsets are only
+        // committed when a checkpoint succeeds, a fresh start re-reads the whole
+        // topic. Checkpointing is what makes operator state and read position
+        // recoverable together.
+        Configuration conf = new Configuration();
+        conf.setString("execution.checkpointing.interval", "10 s");
+        conf.setString("execution.checkpointing.mode", "EXACTLY_ONCE");
+        conf.setString("execution.checkpointing.min-pause", "5 s");
+        conf.setString("execution.checkpointing.timeout", "60 s");
+        // Keep the last checkpoint when the job is cancelled, so a restart can
+        // resume from it rather than from the start of the topic.
+        conf.setString("execution.checkpointing.externalized-checkpoint-retention",
+                "RETAIN_ON_CANCELLATION");
+        conf.setString("restart-strategy.type", "fixed-delay");
+        conf.setString("restart-strategy.fixed-delay.attempts", "3");
+        conf.setString("restart-strategy.fixed-delay.delay", "10 s");
+
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(conf);
+        StreamTableEnvironment tableEnv = StreamTableEnvironment.create(env, settings);
 
         // A Kafka partition that stops receiving data would otherwise hold the
         // global watermark back forever (watermark = min across partitions), so

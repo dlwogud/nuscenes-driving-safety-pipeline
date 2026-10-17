@@ -47,12 +47,19 @@ services:
       - ./flink/lib/flink-connector-jdbc-3.2.0-1.18.jar:/opt/flink/lib/flink-connector-jdbc-3.2.0-1.18.jar
       - ./flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar
       - ./flink/lib/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
+      - ./checkpoints:/opt/flink/checkpoints
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
 
   taskmanager:
     image: flink:1.18.1-scala_2.12-java11
+    # A resource manager — Kubernetes, YARN — replaces a lost TaskManager so the
+    # job's restart strategy has somewhere to run. Compose has no such thing, so
+    # the restart policy stands in for it: without it a killed TaskManager leaves
+    # the job retrying against zero slots until its attempts run out.
+    restart: unless-stopped
     depends_on:
       jobmanager:
         condition: service_started
@@ -62,10 +69,12 @@ services:
       - ./flink/lib/flink-connector-jdbc-3.2.0-1.18.jar:/opt/flink/lib/flink-connector-jdbc-3.2.0-1.18.jar
       - ./flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar
       - ./flink/lib/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
+      - ./checkpoints:/opt/flink/checkpoints
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 2
+        state.checkpoints.dir: file:///opt/flink/checkpoints
 
   postgres:
     image: postgres:15

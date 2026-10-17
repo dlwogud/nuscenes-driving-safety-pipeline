@@ -74,7 +74,13 @@ CREATE TABLE safety_events_sink (
     duration_s    DOUBLE,
     peak_value    DOUBLE,
     bins          BIGINT,
-    entry_speed   DOUBLE
+    entry_speed   DOUBLE,
+    -- Declaring the key switches the JDBC connector from INSERT to upsert.
+    -- Flink's exactly-once covers its own state, not what it has already written
+    -- outside: after a restart it replays from the last checkpoint and writes the
+    -- same rows again. Without this the table grew by exactly the replayed
+    -- amount; with it the same manoeuvre overwrites itself.
+    PRIMARY KEY (vehicle_id, event_type, episode_start) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:postgresql://postgres:5432/vehicle_db',
@@ -93,7 +99,8 @@ CREATE TABLE driving_windows_sink (
     harsh_accels BIGINT,
     episode_cnt  BIGINT,
     avg_entry_speed DOUBLE,
-    flag         STRING
+    flag         STRING,
+    PRIMARY KEY (vehicle_id, window_start) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:postgresql://postgres:5432/vehicle_db',
