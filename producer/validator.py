@@ -42,16 +42,14 @@ def check_required(rec):
 
 
 def check_speed_range(rec):
-    # TODO(재형): 범위 검증 룰 직접 구현하기.
-    speed_kmh=rec.get("speed_kmh")
+    speed_kmh = rec.get("speed_kmh")
+    # Absent is not out of range. check_required already owns missing values,
+    # and reporting the same record twice would say a sensor read an
+    # impossible speed when in fact it read nothing.
     if speed_kmh is None:
         return None
-    if speed_kmh<0 or speed_kmh>200:
+    if speed_kmh < 0 or speed_kmh > 200:
         return "speed_out_of_range"
-    
-    #   speed_kmh가 0 미만이거나 200 초과면 "speed_out_of_range" 반환, 정상이면 None.
-    #   주의: rec.get("speed_kmh")가 None이면 결측이라 여기선 통과(None 반환) —
-    #   결측 처리는 check_required 담당이므로 책임을 섞지 않는다.
     return None
 
 
