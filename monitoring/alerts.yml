@@ -1,0 +1,165 @@
+# Each rule here exists because the condition it names is one the pipeline
+# cannot report on its own. A job that has stopped writing looks exactly like a
+# job with nothing to write, and both look like a healthy cluster from outside;
+# these are the differences that are visible in metrics but not in the output.
+
+groups:
+  - name: liveness
+    rules:
+      # The scrape itself failing is the signal. Nothing inside a dead process
+      # can report that it died.
+      #
+      # This catches a process that is up but wedged, and — for the statically
+      # configured JobManager — one that is gone, because a static target keeps
+      # being scraped and keeps recording up=0. It does NOT catch a crashed
+      # TaskManager: see NoTaskManagerTargets below.
+      - alert: FlinkProcessUnreachable
+        expr: up{job=~"flink-.*"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} at {{ $labels.instance }} is not answering scrapes"
+          description: "The process is gone or wedged. Check `docker compose ps` and the container logs."
+
+      # Measured, not assumed: killing the TaskManager produced exactly one
+      # up=0 sample and then the series stopped, because DNS discovery drops an
+      # address as soon as the container is gone. A rule written as `up == 0
+      # for 30s` therefore reaches "pending" and expires without ever firing —
+      # a deleted target is indistinguishable from one that never existed.
+      # absent() asks the opposite question, which survives the deletion.
+      - alert: NoTaskManagerTargets
+        expr: absent(up{job="flink-taskmanager"})
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No TaskManager is being discovered"
+          description: "Every TaskManager container is gone. The job has nowhere to run."
+
+      # Observed for real: a killed TaskManager left the JobManager alive and
+      # the job in a restart loop against zero slots. Every liveness check that
+      # looked at the JobManager said the cluster was fine.
+      #
+      # Slower than it looks: the count only drops once the heartbeat times out
+      # (50s by default), measured at ~55s after the kill. Treat it as
+      # confirmation of what NoTaskManagerTargets already said, not as the
+      # first warning — and note it goes silent if the JobManager dies too,
+      # since the JobManager is the thing reporting it.
+      - alert: NoTaskManagersRegistered
+        expr: flink_jobmanager_numRegisteredTaskManagers == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "JobManager has no TaskManagers"
+          description: "The job has nowhere to run. Its restart strategy will exhaust its attempts and fail the job permanently."
+
+      - alert: NoRunningJob
+        expr: flink_jobmanager_numRunningJobs == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No job is running on the cluster"
+
+      # Recovery is not silence. The job came back, but something made it fall
+      # over, and the restart budget is finite (fixed-delay, 3 attempts).
+      - alert: JobRestarted
+        expr: increase(flink_jobmanager_job_numRestarts[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job restarted {{ $value | printf \"%.0f\" }} time(s) in the last 5 minutes"
+          description: "Recovered from a checkpoint, so the output should be intact — but find out what failed before the attempts run out."
+
+  - name: checkpointing
+    rules:
+      # Offsets are committed only when a checkpoint succeeds. While
+      # checkpoints fail the job keeps producing correct output, so nothing
+      # looks wrong — but the amount that would be replayed after a crash grows
+      # with every failure.
+      - alert: CheckpointsFailing
+        expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} checkpoint(s) failed in the last 5 minutes"
+          description: "Recovery position is no longer advancing. A failure now replays everything since the last success."
+
+      # Same consequence by a different route: not failing, just never
+      # finishing. The configured interval is 10s, so two minutes without a
+      # completion is not slowness.
+      - alert: CheckpointsStalled
+        expr: >
+          increase(flink_jobmanager_job_numberOfCompletedCheckpoints[2m]) == 0
+          and flink_jobmanager_numRunningJobs > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No checkpoint has completed in 2 minutes"
+          description: "Interval is 10s. Usually backpressure holding up the barriers, or a stuck sink."
+
+      # Duration drifting upward is the early warning for the two above.
+      - alert: CheckpointDurationGrowing
+        expr: flink_jobmanager_job_lastCheckpointDuration > 20000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Checkpoints are taking {{ $value | printf \"%.0f\" }}ms"
+          description: "Against a 60s timeout. State growth or barrier alignment under backpressure."
+
+  - name: throughput
+    rules:
+      # The one number that says whether the pipeline is a pipeline or a
+      # queue. Correct output that arrives an hour late is still an outage.
+      - alert: ConsumerLagGrowing
+        expr: max(flink_taskmanager_job_task_operator_KafkaSourceReader_KafkaConsumer_records_lag_max) > 5000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is {{ $value | printf \"%.0f\" }} records"
+          description: "Consumption is behind production. Raise parallelism/partitions, or find the backpressured operator."
+
+      # Every rule above this one is reported by the system it is watching, so
+      # a cluster that dies outright takes its own alarms with it: in the kill
+      # test the checkpoint and TaskManager alerts both vanished the moment the
+      # JobManager exited. This one is read from the broker, which does not
+      # care whether Flink exists — the committed offset simply stops moving
+      # while the producer keeps writing, and the gap grows.
+      - alert: BrokerSideConsumerLag
+        expr: sum(kafka_consumergroup_lag{consumergroup="flink-safety-group"}) > 2000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Broker reports {{ $value | printf \"%.0f\" }} records unconsumed"
+          description: "Measured outside Flink, so it holds even when the cluster is gone. Either the job is dead or it cannot keep up."
+
+      # Blocked more than half of every second, sustained. Upstream of this
+      # task is being throttled by it.
+      - alert: SustainedBackpressure
+        expr: max(flink_taskmanager_job_task_backPressuredTimeMsPerSecond) > 500
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A task is backpressured {{ $value | printf \"%.0f\" }}ms per second"
+          description: "The slowest operator downstream of it is the bottleneck. Checkpoints will start to stretch next."
+
+  - name: correctness
+    rules:
+      # Records arriving after the watermark has passed their window are
+      # dropped, and dropping them is not an error: the job keeps running and
+      # the output is simply missing those events. This counter is the only
+      # place that loss is visible.
+      - alert: LateRecordsDropped
+        expr: increase(flink_taskmanager_job_task_operator_numLateRecordsDropped[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} late record(s) dropped in the last 5 minutes"
+          description: "Silent data loss. Either the watermark grace is too tight for the real arrival spread, or a producer is lagging."

@@ -52,6 +52,8 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         state.checkpoints.dir: file:///opt/flink/checkpoints
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
 
   taskmanager:
     image: flink:1.18.1-scala_2.12-java11
@@ -75,6 +77,8 @@ services:
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 2
         state.checkpoints.dir: file:///opt/flink/checkpoints
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
 
   postgres:
     image: postgres:15
@@ -93,5 +97,60 @@ services:
       timeout: 5s
       retries: 10
 
+  # An observer that is not part of the thing being observed. Flink's own lag
+  # metric is published by the Kafka consumer running inside the job, so it
+  # disappears exactly when the job does; this reads committed offsets from the
+  # broker and survives the cluster it is reporting on.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["--kafka.server=kafka:9092"]
+    ports:
+      - "9308:9308"
+
+  # The Flink web UI shows the cluster as it is right now, and it is served by
+  # the JobManager — so the one moment it is most needed, a crash, is the moment
+  # it is gone. These two keep the history outside the thing being watched.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    depends_on:
+      - jobmanager
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      # Alert rules get edited far more often than Prometheus gets deployed, and
+      # restarting to pick them up throws away the series that would show
+      # whether the edit was right: `curl -XPOST localhost:9090/-/reload`.
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      # A local, read-only view of a throwaway cluster: a login screen here
+      # protects nothing and makes the dashboard harder to open.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+
 volumes:
   postgres_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,368 @@
+{
+  "uid": "driving-safety-pipeline",
+  "title": "Driving safety pipeline",
+  "tags": ["flink", "kafka"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Is it alive?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Running jobs",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "flink_jobmanager_numRunningJobs", "legendFormat": "jobs" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Registered TaskManagers",
+      "description": "Zero here with the job still 'running' is the failure mode a liveness check on the JobManager cannot see: the job has nowhere to run and is burning its restart attempts.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "flink_jobmanager_numRegisteredTaskManagers", "legendFormat": "TMs" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Restarts",
+      "description": "Against a budget of 3 fixed-delay attempts.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "max(flink_jobmanager_job_numRestarts)", "legendFormat": "restarts" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Failed checkpoints",
+      "description": "Offsets advance only when a checkpoint succeeds. While this climbs the output stays correct, but the amount replayed after a crash grows.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "max(flink_jobmanager_job_numberOfFailedCheckpoints)", "legendFormat": "failed" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Is it keeping up?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka consumer lag (records)",
+      "description": "How far behind the producer the job is reading. Rising = the pipeline has become a queue; output is still correct but no longer timely. Two sources on purpose: the Flink series is published by the consumer inside the job and vanishes when the job dies, while the broker series keeps climbing — that divergence is itself the outage signal.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(flink_taskmanager_job_task_operator_KafkaSourceReader_KafkaConsumer_records_lag_max)",
+          "legendFormat": "reported by Flink"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"flink-safety-group\"})",
+          "legendFormat": "reported by the broker"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 5000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput (records / s)",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(flink_taskmanager_job_task_operator_KafkaSourceReader_KafkaConsumer_records_consumed_rate)",
+          "legendFormat": "read from Kafka"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(flink_taskmanager_job_task_numRecordsOutPerSecond)",
+          "legendFormat": "emitted by all tasks (sum)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } }
+    },
+    {
+      "type": "row",
+      "title": "Can it recover?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint duration (ms)",
+      "description": "Measured at 27ms on an idle pipeline. Drifting toward the 60s timeout means state growth or barriers stuck behind a backpressured operator.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "refId": "A", "expr": "max(flink_jobmanager_job_lastCheckpointDuration)", "legendFormat": "duration" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 20000 },
+              { "color": "red", "value": 60000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint size (bytes)",
+      "description": "The state that has to be written every interval and re-read on recovery. Small here (~150KB) because the only state is in-flight MATCH_RECOGNIZE matches and session-window buffers.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        { "refId": "A", "expr": "max(flink_jobmanager_job_lastCheckpointSize)", "legendFormat": "size" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } }
+    },
+    {
+      "type": "row",
+      "title": "Where is the bottleneck?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Backpressured time (ms per second, per task)",
+      "description": "Milliseconds of every second a task spent blocked waiting for the task downstream of it. The bottleneck is the first task that is busy but NOT backpressured.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "label_replace(max by (task_name) (flink_taskmanager_job_task_backPressuredTimeMsPerSecond), \"t\", \"$1\", \"task_name\", \"(.{0,36}).*\")",
+          "legendFormat": "{{t}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "max": 1000,
+          "unit": "ms",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 500 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["max"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Busy time (ms per second, per task)",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "label_replace(max by (task_name) (flink_taskmanager_job_task_busyTimeMsPerSecond), \"t\", \"$1\", \"task_name\", \"(.{0,36}).*\")",
+          "legendFormat": "{{t}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "max": 1000,
+          "unit": "ms",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["max"] } }
+    },
+    {
+      "type": "row",
+      "title": "Is event time healthy?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Event-time lag (ms)",
+      "description": "Processing time minus the event time of the record being handled. A frozen watermark — the bug that once kept every window from closing — shows up here as a straight climb.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(flink_taskmanager_job_task_operator_currentEmitEventTimeLag)",
+          "legendFormat": "emit event-time lag"
+        },
+        {
+          "refId": "B",
+          "expr": "max(flink_taskmanager_job_task_operator_watermarkLag)",
+          "legendFormat": "watermark lag"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Late records dropped",
+      "description": "Records that arrived after the watermark had passed their window. Dropping them is not an error and produces no log line — the output is simply missing those events, and this counter is the only place that is visible.",
+      "datasource": { "type": "prometheus", "uid": "prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(flink_taskmanager_job_task_operator_numLateRecordsDropped)",
+          "legendFormat": "dropped (cumulative)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } }
+    }
+  ]
+}
