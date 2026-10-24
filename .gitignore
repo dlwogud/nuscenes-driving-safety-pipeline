@@ -237,3 +237,4 @@ checkpoints/
 
 # Personal application material — never belongs in a public repository
 docs/
+savepoints/

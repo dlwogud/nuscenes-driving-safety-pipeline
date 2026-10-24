@@ -6,6 +6,11 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    # Topic metadata lives here. Without it a `compose down` leaves Kafka's log
+    # segments describing topics the cluster no longer believes exist.
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -25,6 +30,11 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    # The dead-letter topics are the one part of this system whose whole purpose
+    # is to outlive what wrote to them, and until this volume existed a
+    # `docker compose down` emptied the quarantine along with everything else.
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
       interval: 10s
@@ -33,7 +43,11 @@ services:
 
   jobmanager:
     image: flink:1.18.1-scala_2.12-java11
-    command: standalone-job --job-classname com.example.vehicle.DrivingSafetyJob
+    # RESTORE_ARGS carries --fromSavepoint <path> when the job is being resumed
+    # after a deliberate stop. Empty for an ordinary start, which with
+    # scan.startup.mode=earliest-offset means reading the topic from the
+    # beginning — correct for a repair pass, wrong for a redeploy.
+    command: standalone-job --job-classname com.example.vehicle.DrivingSafetyJob ${RESTORE_ARGS:-}
     depends_on:
       kafka:
         condition: service_healthy
@@ -48,6 +62,9 @@ services:
       - ./flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar
       - ./flink/lib/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
       - ./checkpoints:/opt/flink/checkpoints
+      # Savepoints are written by an operator and outlive the job that made
+      # them, so they live apart from the checkpoints the job owns.
+      - ./savepoints:/opt/flink/savepoints
     environment:
       # The job's main() runs here, so this is where its watermark settings are
       # read. Overridable so the idleness behaviour can be A/B tested against a
@@ -56,6 +73,7 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
 
@@ -76,11 +94,15 @@ services:
       - ./flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.2.0-1.18.jar
       - ./flink/lib/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
       - ./checkpoints:/opt/flink/checkpoints
+      # Savepoints are written by an operator and outlive the job that made
+      # them, so they live apart from the checkpoints the job owns.
+      - ./savepoints:/opt/flink/savepoints
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 2
         state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
 
@@ -158,3 +180,6 @@ volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
