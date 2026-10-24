@@ -397,6 +397,46 @@ In production the repair would read from `scan.startup.mode = specific-offsets` 
 reprocessing the whole topic — the earliest `ts_us` in the late topic is precisely the point to
 rewind to.
 
+## Deploying a change
+
+Editing one line of SQL used to mean restarting, and restarting meant reading the whole topic
+again — `earliest-offset` is right for the repair pass above and wrong for every ordinary deploy.
+It also lost whatever was in flight: a hard brake halfway through its episode simply never
+appeared, because nothing carried operator state across the gap.
+
+A savepoint carries both the state and the read position. It stores what a checkpoint stores; what
+differs is who takes it and why — a checkpoint is the job insuring itself every ten seconds, a
+savepoint is an operator deliberately putting the job down.
+
+```bash
+curl -XPOST localhost:8081/jobs/$JID/stop \
+  -H 'Content-Type: application/json' \
+  -d '{"drain": false, "targetDirectory": "file:///opt/flink/savepoints"}'
+
+RESTORE_ARGS="--fromSavepoint /opt/flink/savepoints/savepoint-xxxxxx" \
+  docker compose up -d jobmanager
+```
+
+`drain` stays false. Draining advances the watermark to infinity and closes every in-flight
+window, which is what you want when retiring a job and precisely not what you want when upgrading
+one. Resumed this way the job read **0 records** where a plain restart read 5,802, and each
+partition picked up at the exact offset it stopped on.
+
+**What survives an SQL change, and what does not.** Changing a threshold and restoring works: a
+literal does not alter which operators exist, and the job recompiles the SQL at startup, so the
+old state lands in a plan built from the new number. Retiring a rule does not:
+
+```
+Cannot map checkpoint/savepoint state for operator 34dd787d... to the new program,
+because the operator is not available in the new program.
+```
+
+State is matched by operator UID, and SQL derives those from the plan rather than from anything a
+person wrote — so compatibility is a question of operator *structure*, not of text. Flink refuses
+rather than discarding quietly, which is the right default. `--allowNonRestoredState` gets past it
+and records each dropped operator as a single INFO line, which is quiet enough to make it a poor
+choice for a standing flag.
+
 ## Running it
 
 Requires Docker, Python 3.9+, and the
